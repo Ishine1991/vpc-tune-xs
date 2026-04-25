@@ -24,7 +24,7 @@ apt update -y && apt install curl -y
 
 ```bash
 # 安装别名
-bash <(curl -fsSL "https://raw.githubusercontent.com/Ishine1991/vps-tcp/main/install-alias.sh?$(date +%s)")
+bash <(curl -fsSL "https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/install-alias.sh?$(date +%s)")
 
 # 重新加载配置
 source ~/.bashrc  # 或 source ~/.zshrc
@@ -47,13 +47,13 @@ bbr
 
 ```bash
 # 推荐：使用时间戳参数确保获取最新版本（无缓存）
-bash <(curl -fsSL "https://raw.githubusercontent.com/Ishine1991/vps-tcp/main/net-tcp-tune.sh?$(date +%s)")
+bash <(curl -fsSL "https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh?$(date +%s)")
 ```
 
 ### 方式3：下载到本地
 
 ```bash
-wget -O net-tcp-tune.sh "https://raw.githubusercontent.com/Ishine1991/vps-tcp/main/net-tcp-tune.sh?$(date +%s)"
+wget -O net-tcp-tune.sh "https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh?$(date +%s)"
 chmod +x net-tcp-tune.sh
 ./net-tcp-tune.sh
 ```
@@ -207,4 +207,4 @@ A: 是的，首次安装内核后必须重启服务器。后续修改参数（�
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Ishine1991/vps-tcp&type=Date)](https://www.star-history.com/#Ishine1991/vps-tcp&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Ishine1991/vpc-tune-xs&type=Date)](https://www.star-history.com/#Ishine1991/vpc-tune-xs&Date)
