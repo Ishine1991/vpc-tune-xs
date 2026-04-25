@@ -11375,13 +11375,15 @@ remove_bbr_lotserver() {
 }
 
 #=============================================================================
-# TCP 单连接限速管理（FQ + SO_MAX_PACING_RATE）
-# 适用场景：3x-ui (x-ui) / Xray / Snell 等基于 TCP 的代理，按"每个连接"限速
+# TCP 单连接限速管理（FQ qdisc maxrate）
+# 适用场景：3x-ui (x-ui) / Xray / Snell 等基于 TCP 的代理，按"每个 flow"限速
 # 核心原理：
-#   1. Linux 内核 FQ 调度器 + SO_MAX_PACING_RATE，对每个 socket 内核级 pacing
-#   2. 通过 LD_PRELOAD hook accept/accept4，给 accept 出来的连接设置 pacing 速率
-#   3. 通过 systemd drop-in 注入到目标服务（默认 x-ui，3x-ui 的服务名）
-# 注意：限速仅作用于"发送方向"（服务器 -> 客户端），即用户的下载速度
+#   1. Linux 内核 FQ 调度器按 flow 公平排队
+#   2. FQ 的 maxrate 参数对每个 flow 设置最大发送速率
+#   3. 该方案不依赖应用进程实现，适合 Xray/3x-ui 这类 Go 程序
+# 注意：
+#   1. 限速作用于网卡发送方向（服务器 -> 外部），即用户下载/节点出站
+#   2. fq maxrate 是网卡级策略，会影响该服务器所有经过该网卡的出站 flow
 #=============================================================================
 
 PACING_CONFIG_FILE="/etc/net-tcp-tune-pacing.conf"
@@ -11520,9 +11522,9 @@ net.ipv4.tcp_fastopen = 3
 # TIME_WAIT 复用，避免端口耗尽
 net.ipv4.tcp_tw_reuse = 1
 
-# 减小默认/最大 buffer，降低 bufferbloat（限速场景下大 buffer 无意义）
-net.ipv4.tcp_rmem = 4096 32768 1048576
-net.ipv4.tcp_wmem = 4096 32768 1048576
+# 游戏加速场景：进一步减小默认/最大 buffer，降低内存占用和 bufferbloat
+net.ipv4.tcp_rmem = 4096 16384 524288
+net.ipv4.tcp_wmem = 4096 16384 524288
 
 # 提高 backlog，应对短时间大量握手
 net.core.somaxconn = 32768
@@ -11531,7 +11533,7 @@ EOF
     sysctl -p "$PACING_SYSCTL_FILE" >/dev/null 2>&1
     echo -e "${gl_lv}✅ 已写入 sysctl: ${PACING_SYSCTL_FILE}${gl_bai}"
 
-    # 给所有非 lo 网卡挂上 fq
+    # 给所有非 lo 网卡挂上 fq（未启用限速时不设置 maxrate）
     local iface
     for iface in $(ls /sys/class/net 2>/dev/null); do
         [ "$iface" = "lo" ] && continue
@@ -11539,6 +11541,42 @@ EOF
         if tc qdisc replace dev "$iface" root fq 2>/dev/null; then
             echo -e "  ${gl_lv}✓${gl_bai} ${iface}: fq qdisc 已启用"
         fi
+    done
+}
+
+pacing_rate_to_tc_kbit() {
+    local rate_bps="$1"
+    local rate_kbit=$((rate_bps * 8 / 1000))
+    [ "$rate_kbit" -lt 1 ] && rate_kbit=1
+    echo "${rate_kbit}kbit"
+}
+
+pacing_apply_fq_maxrate() {
+    local rate_bps="$1"
+    local tc_rate
+    tc_rate=$(pacing_rate_to_tc_kbit "$rate_bps")
+
+    local iface applied=0
+    for iface in $(ls /sys/class/net 2>/dev/null); do
+        [ "$iface" = "lo" ] && continue
+        [ -d "/sys/class/net/$iface" ] || continue
+        if tc qdisc replace dev "$iface" root fq maxrate "$tc_rate" 2>/dev/null; then
+            echo -e "  ${gl_lv}✓${gl_bai} ${iface}: fq maxrate ${tc_rate} 已启用（每 flow）"
+            applied=1
+        else
+            echo -e "  ${gl_huang}⚠️${gl_bai} ${iface}: fq maxrate 设置失败，可能是内核或容器不支持"
+        fi
+    done
+
+    [ "$applied" = "1" ]
+}
+
+pacing_clear_fq_maxrate() {
+    local iface
+    for iface in $(ls /sys/class/net 2>/dev/null); do
+        [ "$iface" = "lo" ] && continue
+        [ -d "/sys/class/net/$iface" ] || continue
+        tc qdisc replace dev "$iface" root fq 2>/dev/null
     done
 }
 
@@ -11610,21 +11648,12 @@ pacing_status_summary() {
     echo -e "${gl_kjlan}━━━━━━━━━━ 当前状态 ━━━━━━━━━━${gl_bai}"
     echo -e "  FQ 调度器:        ${fq_enabled}"
     echo -e "  BBR 拥塞控制:     ${bbr_enabled}"
-    echo -e "  限速动态库:       $([ -f "$PACING_LIB_PATH" ] && echo "${gl_lv}已编译${gl_bai}" || echo "${gl_huang}未编译${gl_bai}")"
+    echo -e "  限速方式:         ${gl_lv}FQ qdisc maxrate（网卡级，每 flow）${gl_bai}"
     echo -e "  限速总开关:       $([ "${PACING_ENABLED:-0}" = "1" ] && echo "${gl_lv}启用${gl_bai}" || echo "${gl_huang}未启用${gl_bai}")"
     echo -e "  当前限速值:       ${gl_huang}$(pacing_human_rate "${PACING_RATE_BPS:-0}")${gl_bai}"
-    echo -e "  作用服务:         ${gl_huang}${PACING_TARGETS:-x-ui}${gl_bai}"
+    echo -e "  作用范围:         ${gl_huang}所有非 lo 网卡的出站 flow${gl_bai}"
     echo -e "  游戏优化模式:     $([ "${GAME_MODE:-0}" = "1" ] && echo "${gl_lv}启用${gl_bai}" || echo "${gl_huang}未启用${gl_bai}")"
-
-    # 显示每个目标服务的注入状态
-    local t
-    for t in ${PACING_TARGETS:-x-ui}; do
-        if [ -f "/etc/systemd/system/${t}.service.d/pacing.conf" ]; then
-            echo -e "    ├─ ${t}: ${gl_lv}已注入${gl_bai}"
-        else
-            echo -e "    ├─ ${t}: ${gl_huang}未注入${gl_bai}"
-        fi
-    done
+    echo -e "  网卡规则:         ${gl_huang}$(tc qdisc show dev "$main_iface" 2>/dev/null | head -1)${gl_bai}"
     echo ""
 }
 
@@ -11681,10 +11710,7 @@ pacing_enable_all() {
     # 1. 输入限速值
     pacing_input_rate || { break_end; return; }
 
-    # 2. 输入目标服务
-    pacing_input_targets
-
-    # 3. 是否启用游戏优化
+    # 2. 是否启用游戏优化
     echo ""
     read -e -p "是否启用游戏延迟优化（小buffer + 关闭慢启动重启）? [Y/n]: " game_choice
     if [[ ! "$game_choice" =~ ^[Nn]$ ]]; then
@@ -11696,28 +11722,27 @@ pacing_enable_all() {
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━ 开始执行 ━━━━━━━━━━${gl_bai}"
 
-    # 4. 应用 sysctl + FQ
-    echo -e "${gl_kjlan}[1/3] 配置 FQ 调度器 + BBR + 系统参数...${gl_bai}"
+    # 3. 应用 sysctl + FQ
+    echo -e "${gl_kjlan}[1/2] 配置 FQ 调度器 + BBR + 系统参数...${gl_bai}"
     pacing_apply_sysctl
 
-    # 5. 编译限速库
+    # 4. 应用 fq maxrate
     echo ""
-    echo -e "${gl_kjlan}[2/3] 编译 LD_PRELOAD 限速库...${gl_bai}"
-    if ! pacing_compile_lib; then
-        echo -e "${gl_hong}限速库编译失败，已中止${gl_bai}"
+    echo -e "${gl_kjlan}[2/2] 配置 FQ maxrate（每 flow 限速）...${gl_bai}"
+    if ! pacing_apply_fq_maxrate "$PACING_RATE_BPS"; then
+        echo -e "${gl_hong}fq maxrate 设置失败，已中止${gl_bai}"
         break_end
         return
     fi
 
-    # 6. 注入到所有目标服务
-    echo ""
-    echo -e "${gl_kjlan}[3/3] 注入 LD_PRELOAD 到目标服务...${gl_bai}"
+    # 清理旧版本可能写入的 LD_PRELOAD 注入，避免误导状态
     local svc
-    for svc in $PACING_TARGETS; do
-        pacing_inject_service "$svc" "$PACING_RATE_BPS"
+    for svc in ${PACING_TARGETS:-x-ui} x-ui xray snell; do
+        pacing_remove_inject "$svc"
     done
 
     PACING_ENABLED=1
+    PACING_TARGETS="all-ifaces"
     pacing_save_config
 
     echo ""
@@ -11728,8 +11753,8 @@ pacing_enable_all() {
     echo ""
     echo -e "${gl_huang}验证方法:${gl_bai}"
     echo "  1. 让用户连接 3x-ui 节点并下载文件"
-    echo "  2. 在服务器执行: ss -tin | grep -E 'pacing_rate|send' | head -20"
-    echo "  3. 应能看到每个连接的 pacing_rate 字段"
+    echo "  2. 在服务器执行: tc qdisc show dev eth0"
+    echo "  3. 应能看到: qdisc fq ... maxrate <你的限速值>"
     echo ""
     break_end
 }
@@ -11742,13 +11767,10 @@ pacing_modify_rate() {
         return
     fi
     pacing_input_rate || { break_end; return; }
-    pacing_save_config
     echo ""
-    echo -e "${gl_kjlan}重新注入到目标服务...${gl_bai}"
-    local svc
-    for svc in $PACING_TARGETS; do
-        pacing_inject_service "$svc" "$PACING_RATE_BPS"
-    done
+    echo -e "${gl_kjlan}重新配置 FQ maxrate...${gl_bai}"
+    pacing_apply_fq_maxrate "$PACING_RATE_BPS" || { break_end; return; }
+    pacing_save_config
     echo ""
     echo -e "${gl_lv}✅ 限速值已更新为: $(pacing_human_rate "$PACING_RATE_BPS")${gl_bai}"
     break_end
@@ -11756,14 +11778,22 @@ pacing_modify_rate() {
 
 pacing_view_realtime() {
     clear
-    echo -e "${gl_kjlan}=== 实时连接 pacing 状态（前 30 条）===${gl_bai}"
+    echo -e "${gl_kjlan}=== 实时连接/网卡限速状态 ===${gl_bai}"
     echo ""
     if ! command -v ss >/dev/null 2>&1; then
         echo -e "${gl_hong}缺少 ss 命令${gl_bai}"
         break_end
         return
     fi
-    echo "格式: <对端地址>  pacing_rate=<速率>  send=<当前发送速率>"
+    echo -e "${gl_kjlan}[1] 当前网卡 qdisc:${gl_bai}"
+    local iface
+    for iface in $(ls /sys/class/net 2>/dev/null); do
+        [ "$iface" = "lo" ] && continue
+        tc qdisc show dev "$iface" 2>/dev/null | sed "s/^/  [$iface] /"
+    done
+    echo ""
+    echo -e "${gl_kjlan}[2] 当前 TCP 连接发送状态（前 30 条，仅辅助观察）:${gl_bai}"
+    echo "格式: <对端地址>  pacing_rate=<内核估计>  send=<当前发送速率>"
     echo "------------------------------------------------"
     ss -tinH 2>/dev/null | awk '
         /^ESTAB/ {peer=$5; next}
@@ -11779,9 +11809,9 @@ pacing_view_realtime() {
 
     echo ""
     echo -e "${gl_huang}说明:${gl_bai}"
-    echo "  - pacing_rate: 内核为该 socket 设置的最大发送速率"
-    echo "  - 如果所有连接的 pacing_rate 都等于你设置的限速值 → 注入生效"
-    echo "  - 如果看到 unlimited 或没有 pacing_rate → 检查服务是否重启"
+    echo "  - 本版本使用 fq maxrate，真实限速以 tc qdisc 中的 maxrate 为准"
+    echo "  - ss 中的 pacing_rate 是 BBR/FQ 对 socket 的动态估计值，不再要求等于限速值"
+    echo "  - 测速请用客户端通过 vmess 下载测速，不要用服务器本地测速"
     echo ""
     break_end
 }
@@ -11793,6 +11823,7 @@ pacing_disable_keep_fq() {
     for svc in $PACING_TARGETS; do
         pacing_remove_inject "$svc"
     done
+    pacing_clear_fq_maxrate
     PACING_ENABLED=0
     PACING_RATE_BPS=0
     pacing_save_config
@@ -11846,12 +11877,12 @@ manage_tcp_pacing_limit() {
         clear
         pacing_load_config
         echo -e "${gl_zi}╔════════════════════════════════════════════════╗${gl_bai}"
-        echo -e "${gl_zi}║  TCP 单连接限速管理  (FQ + SO_MAX_PACING_RATE)  ║${gl_bai}"
+        echo -e "${gl_zi}║       TCP 单连接限速管理  (FQ maxrate)        ║${gl_bai}"
         echo -e "${gl_zi}╚════════════════════════════════════════════════╝${gl_bai}"
         echo ""
         pacing_status_summary
         echo -e "${gl_kjlan}━━━━━━━━━━ 操作选项 ━━━━━━━━━━${gl_bai}"
-        echo "  1. 一键启用（FQ + BBR + 注入服务 + 设置限速）⭐"
+        echo "  1. 一键启用（FQ + BBR + 每flow限速）⭐"
         echo "  2. 修改每连接限速值"
         echo "  3. 查看实时连接 pacing 状态（验证是否生效）"
         echo "  4. 关闭限速（保留 FQ + BBR + 游戏优化）"
