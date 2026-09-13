@@ -11383,13 +11383,51 @@ PACING_LOCK_FILE="/run/net-tcp-tune-pacing.lock"
 pacing_error() { echo "错误: $*" >&2; }
 
 pacing_dependencies() {
-    local tool
+    local tool package os_id="" os_like="" ID="" ID_LIKE=""
+    local missing=() packages=()
+
     for tool in tc ip jq flock mktemp; do
-        command -v "$tool" >/dev/null || {
-            pacing_error "缺少 $tool；Debian 请安装 iproute2 jq util-linux。"
-            return 1
-        }
+        command -v "$tool" >/dev/null && continue
+        missing+=("$tool")
+        case "$tool" in
+            tc|ip) package="iproute2" ;;
+            jq) package="jq" ;;
+            flock) package="util-linux" ;;
+            mktemp) package="coreutils" ;;
+        esac
+        case " ${packages[*]} " in
+            *" $package "*) ;;
+            *) packages+=("$package") ;;
+        esac
     done
+
+    ((${#missing[@]} == 0)) && return 0
+
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        os_id="${ID,,}"
+        os_like="${ID_LIKE,,}"
+    fi
+    if [[ $EUID -eq 0 && "${os_id} ${os_like}" =~ (debian|ubuntu) ]] && command -v apt-get >/dev/null; then
+        echo "选项 39 缺少 ${missing[*]}，正在安装 ${packages[*]}..."
+        if DEBIAN_FRONTEND=noninteractive apt-get update &&
+           DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"; then
+            for tool in tc ip jq flock mktemp; do
+                command -v "$tool" >/dev/null || {
+                    pacing_error "安装完成后仍找不到 $tool。"
+                    return 1
+                }
+            done
+            echo "选项 39 的依赖已安装完成。"
+            return 0
+        fi
+        pacing_error "自动安装依赖失败；请检查上方 apt 输出。"
+        return 1
+    fi
+
+    pacing_error "缺少 ${missing[*]}；请安装 ${packages[*]} 后重试。"
+    return 1
 }
 
 # maxrate 的 netlink 字段为 u32 字节/秒，UINT32_MAX 表示无限制。
