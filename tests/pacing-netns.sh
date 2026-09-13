@@ -3,11 +3,14 @@
 # Debian dependencies: iproute2 jq util-linux. Run: sudo bash tests/pacing-netns.sh
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-for tool in unshare ip tc jq; do command -v "$tool" >/dev/null; done
+for tool in unshare mount ip tc jq; do command -v "$tool" >/dev/null; done
 [[ $EUID == 0 ]] || { echo 'Run as root to create an isolated network namespace.' >&2; exit 1; }
-unshare --net bash -s -- "$repo" <<'TEST'
+unshare --net --mount --propagation private bash -s -- "$repo" <<'TEST'
 set -euo pipefail
 repo=$1
+# sysfs must be mounted in the new network namespace to expose its interfaces.
+# The private mount namespace prevents changing the host's /sys mount.
+mount -t sysfs sysfs /sys
 work=$(mktemp -d /tmp/pacing-netns.XXXXXX)
 trap 'rm -rf -- "$work"' EXIT
 source <(sed -n '/^# TCP\/FQ 每流限速：/,/^#启用BBR+cake/{ /^#启用BBR+cake/d; p; }' "$repo/net-tcp-tune.sh")
