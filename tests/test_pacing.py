@@ -56,6 +56,9 @@ source '{shell_path(self.base / 'module.sh')}'
 PACING_CONFIG_FILE='{shell_path(self.config)}'
 PACING_SYSCTL_FILE='{shell_path(self.base / 'old.conf')}'
 PACING_LOCK_FILE='{shell_path(self.base / 'lock')}'
+PACING_POLICY_FILE='{shell_path(self.base / 'policy.json')}'
+PACING_SERVICE_FILE='{shell_path(self.base / 'pacing.service')}'
+PACING_INSTALLED_SCRIPT='{shell_path(self.base / 'installed/net-tcp-tune.sh')}'
 KERNEL='{shell_path(self.state)}'
 EVENTS='{shell_path(self.events)}'
 pacing_boot_id() {{ echo boot-1; }}
@@ -186,6 +189,39 @@ pacing_write_state() { saves=$((saves+1)); [[ $saves != 2 ]] || return 1; origin
         self.assertNotEqual(self.run_shell('pacing_disable', 'pacing_boot_id() { echo boot-2; }').returncode, 0)
         self.ok('pacing_forget_stale', 'pacing_boot_id() { echo boot-2; }')
         self.assertFalse(self.config.exists())
+
+    def test_boot_restore_accepts_default_fq_handle_without_replacing_queue(self):
+        data = json.loads(self.state.read_text())
+        data['eth0']['handle'] = '0:'
+        self.state.write_text(json.dumps(data))
+        (self.base / 'policy.json').write_text(
+            json.dumps({'version': 1, 'iface': 'eth0', 'rate': 10485760}))
+        self.ok('pacing_restore_boot')
+        self.assertEqual(self.rate(), 10485760)
+        self.assertNotIn('handle 0:', self.events.read_text())
+        saved = json.loads(self.config.read_text())
+        self.assertEqual(saved['boot'], 'boot-1')
+        self.assertEqual(saved['phase'], 'active')
+
+    def test_boot_restore_refuses_foreign_cap(self):
+        self.write_kernel(rate=123456)
+        (self.base / 'policy.json').write_text(
+            json.dumps({'version': 1, 'iface': 'eth0', 'rate': 10485760}))
+        self.assertNotEqual(self.run_shell('pacing_restore_boot').returncode, 0)
+        self.assertEqual(self.rate(), 123456)
+        self.assertFalse(self.config.exists())
+
+    def test_autostart_install_and_remove(self):
+        setup = '''systemctl() { printf '%s\n' "$*" >> "$EVENTS"; }
+'''
+        self.ok('pacing_enable_autostart eth0 10485760; pacing_read_policy >/dev/null', setup)
+        policy = json.loads((self.base / 'policy.json').read_text())
+        self.assertEqual(policy, {'version': 1, 'iface': 'eth0', 'rate': 10485760})
+        self.assertIn('--restore-pacing', (self.base / 'pacing.service').read_text())
+        self.assertTrue((self.base / 'installed/net-tcp-tune.sh').exists())
+        self.ok('pacing_disable_autostart', setup)
+        self.assertFalse((self.base / 'policy.json').exists())
+        self.assertFalse((self.base / 'pacing.service').exists())
 
     def test_legacy_not_executed_and_blocks_enable(self):
         self.config.write_text('echo CONFIG_EXECUTED\n')

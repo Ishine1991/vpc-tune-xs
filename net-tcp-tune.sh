@@ -11379,6 +11379,9 @@ remove_bbr_lotserver() {
 PACING_CONFIG_FILE="/etc/net-tcp-tune-pacing.conf"
 PACING_SYSCTL_FILE="/etc/sysctl.d/99-game-pacing.conf"
 PACING_LOCK_FILE="/run/net-tcp-tune-pacing.lock"
+PACING_POLICY_FILE="/etc/net-tcp-tune-pacing-policy.json"
+PACING_SERVICE_FILE="/etc/systemd/system/net-tcp-tune-pacing.service"
+PACING_INSTALLED_SCRIPT="/usr/local/lib/net-tcp-tune/net-tcp-tune.sh"
 
 pacing_error() { echo "错误: $*" >&2; }
 
@@ -11386,14 +11389,14 @@ pacing_dependencies() {
     local tool package os_id="" os_like="" ID="" ID_LIKE=""
     local missing=() packages=()
 
-    for tool in tc ip jq flock mktemp; do
+    for tool in tc ip jq flock mktemp install; do
         command -v "$tool" >/dev/null && continue
         missing+=("$tool")
         case "$tool" in
             tc|ip) package="iproute2" ;;
             jq) package="jq" ;;
             flock) package="util-linux" ;;
-            mktemp) package="coreutils" ;;
+            mktemp|install) package="coreutils" ;;
         esac
         case " ${packages[*]} " in
             *" $package "*) ;;
@@ -11413,7 +11416,7 @@ pacing_dependencies() {
         echo "选项 39 缺少 ${missing[*]}，正在安装 ${packages[*]}..."
         if DEBIAN_FRONTEND=noninteractive apt-get update &&
            DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"; then
-            for tool in tc ip jq flock mktemp; do
+            for tool in tc ip jq flock mktemp install; do
                 command -v "$tool" >/dev/null || {
                     pacing_error "安装完成后仍找不到 $tool。"
                     return 1
@@ -11510,6 +11513,69 @@ pacing_read_state() {
         (.phase == "active" or .phase == "pending"))' "$PACING_CONFIG_FILE" 2>/dev/null
 }
 
+pacing_write_file() {
+    local file="$1" mode="$2" data="$3" tmp
+    tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+    if printf '%s\n' "$data" > "$tmp" && chmod "$mode" "$tmp" && mv -f -- "$tmp" "$file"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+pacing_read_policy() {
+    [[ -f "$PACING_POLICY_FILE" ]] || return 1
+    jq -ce 'select(.version == 1 and (.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and
+        .iface != "lo" and (.rate | type == "number" and . > 0 and
+        .rate < 4294967295 and .rate == floor))' "$PACING_POLICY_FILE" 2>/dev/null
+}
+
+pacing_enable_autostart() {
+    local iface="$1" rate="$2" source policy unit dir
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
+    pacing_valid_rate "$rate" && ((rate > 0 && rate < 4294967295)) || return 1
+    command -v systemctl >/dev/null || { pacing_error "未找到 systemctl，无法设置开机恢复。"; return 1; }
+    source="${BASH_SOURCE[0]}"
+    [[ -r "$source" ]] || { pacing_error "无法读取当前脚本，未设置开机恢复。"; return 1; }
+    dir=${PACING_INSTALLED_SCRIPT%/*}
+    mkdir -p -- "$dir" || return 1
+    install -m 700 -- "$source" "${PACING_INSTALLED_SCRIPT}.tmp" || return 1
+    mv -f -- "${PACING_INSTALLED_SCRIPT}.tmp" "$PACING_INSTALLED_SCRIPT" || return 1
+    unit='[Unit]
+Description=Restore net-tcp-tune FQ per-flow rate limit
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=6
+ConditionPathExists=/etc/net-tcp-tune-pacing-policy.json
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/lib/net-tcp-tune/net-tcp-tune.sh --restore-pacing
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target'
+    pacing_write_file "$PACING_SERVICE_FILE" 644 "$unit" || return 1
+    systemctl daemon-reload || return 1
+    systemctl enable net-tcp-tune-pacing.service || return 1
+    policy=$(jq -cn --arg iface "$iface" --argjson rate "$rate" \
+        '{version:1,iface:$iface,rate:$rate}') || return 1
+    pacing_write_file "$PACING_POLICY_FILE" 600 "$policy" || return 1
+    echo "已启用开机自动恢复限速。"
+}
+
+pacing_disable_autostart() {
+    if [[ ! -e "$PACING_POLICY_FILE" && ! -e "$PACING_SERVICE_FILE" ]]; then return 0; fi
+    if command -v systemctl >/dev/null; then
+        systemctl disable net-tcp-tune-pacing.service >/dev/null 2>&1 || return 1
+    fi
+    rm -f -- "$PACING_POLICY_FILE" "$PACING_SERVICE_FILE" "$PACING_INSTALLED_SCRIPT" || return 1
+    if command -v systemctl >/dev/null; then systemctl daemon-reload || return 1; fi
+    echo "已关闭开机自动恢复限速。"
+}
+
 pacing_same_device() {
     local state="$1" root="$2" iface
     iface=$(jq -r .iface <<< "$state")
@@ -11537,7 +11603,9 @@ pacing_set_rate() {
                 *) pacing_error "$iface 上限已变化，停止修改并保留记录。"; return 1;;
             esac
         fi
-        handle_args=(handle "$(jq -r .handle <<< "$expected_state")")
+        if [[ $(jq -r .handle <<< "$expected_state") != "0:" ]]; then
+            handle_args=(handle "$(jq -r .handle <<< "$expected_state")")
+        fi
     fi
     tc qdisc change dev "$iface" root "${handle_args[@]}" fq maxrate "$((10#$rate * 8))bit" || return 1
     root=$(pacing_read_root "$iface") || return 1
@@ -11628,6 +11696,56 @@ pacing_disable() {
     echo "已验证 $iface 恢复为 $(pacing_human_rate "$original")；其他队列和 TCP 参数保持原值。"
 }
 
+# systemd 仅根据独立策略文件恢复；旧启动记录必须验证为过期后才会替换。
+pacing_restore_boot() {
+    local policy iface rate state="" root before boot ifindex handle pending
+    policy=$(pacing_read_policy) || { pacing_error "开机恢复策略不存在或已损坏。"; return 1; }
+    iface=$(jq -r .iface <<< "$policy")
+    rate=$(jq -r .rate <<< "$policy")
+    boot=$(pacing_boot_id) && [[ -n "$boot" ]] || return 1
+
+    if [[ -f "$PACING_CONFIG_FILE" ]]; then
+        state=$(pacing_read_state) || { pacing_error "运行记录损坏，拒绝开机恢复。"; return 1; }
+        if [[ $(jq -r .boot <<< "$state") == "$boot" ]]; then
+            [[ $(jq -r .iface <<< "$state") == "$iface" && $(jq -r .rate <<< "$state") == "$rate" ]] || {
+                pacing_error "本次启动已有不同的限速记录。"; return 1;
+            }
+            root=$(pacing_read_root "$iface") || return 1
+            pacing_require_fq "$root" || return 1
+            pacing_same_device "$state" "$root" || return 1
+            [[ $(pacing_root_rate "$root") == "$rate" ]] || return 1
+            echo "本次启动的限速已经生效。"
+            return 0
+        fi
+        rm -f -- "$PACING_CONFIG_FILE" || return 1
+    fi
+
+    root=$(pacing_read_root "$iface") || { pacing_error "网卡 $iface 尚未就绪。"; return 1; }
+    pacing_require_fq "$root" || return 1
+    before=$(pacing_root_rate "$root") || return 1
+    [[ "$before" == 4294967295 || "$before" == "$rate" ]] || {
+        pacing_error "$iface 已存在其他上限，拒绝覆盖。"; return 1;
+    }
+    ifindex=$(pacing_ifindex "$iface") && [[ "$ifindex" =~ ^[0-9]+$ ]] || return 1
+    handle=$(jq -r .handle <<< "$root")
+    [[ "$handle" =~ ^[0-9a-fA-F]+:$ ]] || return 1
+    pending=$(jq -cn --arg iface "$iface" --arg boot "$boot" --arg ifindex "$ifindex" \
+        --arg handle "$handle" --argjson rate "$rate" --argjson previous "$before" \
+        '{version:2,iface:$iface,boot:$boot,ifindex:$ifindex,handle:$handle,
+          original:4294967295,previous_rate:$previous,rate:$rate,phase:"pending"}') || return 1
+    pacing_write_state "$pending" || return 1
+    if pacing_set_rate "$iface" "$rate" "$pending" "$before $rate" &&
+       pacing_write_state "$(jq -c '.phase="active"' <<< "$pending")"; then
+        echo "已在 $iface 恢复每流上限: $(pacing_human_rate "$rate")"
+        return 0
+    fi
+    pacing_error "开机恢复失败，尝试还原本次修改。"
+    if pacing_set_rate "$iface" "$before" "$pending" "$before $rate"; then
+        rm -f -- "$PACING_CONFIG_FILE"
+    fi
+    return 1
+}
+
 pacing_locked() (
     pacing_dependencies || exit 1
     exec 9>"$PACING_LOCK_FILE" || exit 1
@@ -11638,26 +11756,54 @@ pacing_locked() (
 pacing_enable_all() {
     local iface
     pacing_input_rate || return 1
-    if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_locked pacing_disable; return $?; fi
+    if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_disable_all; return $?; fi
     ip -br link
     echo "仅对所选接口现有根 FQ 设置每流上限；包含该接口上的 TCP/UDP 等出站流量。"
-    echo "不会设置 BBR、缩小缓冲区或覆盖其他队列；速率不自动跨重启/接口重建恢复。"
+    echo "不会设置 BBR、缩小缓冲区或覆盖其他队列；成功后会设置开机自动恢复。"
     read -r -p "请输入要限速的网卡（回车取消）: " iface || return 1
     [[ -n "$iface" ]] || return 1
-    pacing_locked pacing_apply_rate "$iface" "$PACING_INPUT_RATE"
+    if pacing_locked pacing_apply_rate "$iface" "$PACING_INPUT_RATE"; then
+        pacing_enable_autostart "$iface" "$PACING_INPUT_RATE" || {
+            pacing_error "当前限速已生效，但开机自动恢复设置失败。"
+            return 1
+        }
+        return 0
+    fi
+    return 1
 }
 
 pacing_modify_rate() {
     local state
     state=$(pacing_read_state) || { pacing_error "没有可修改的本版本配置。"; return 1; }
     pacing_input_rate || return 1
-    if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_locked pacing_disable
-    else pacing_locked pacing_apply_rate "$(jq -r .iface <<< "$state")" "$PACING_INPUT_RATE"; fi
+    if [[ "$PACING_INPUT_RATE" == 0 ]]; then
+        pacing_disable_autostart && pacing_locked pacing_disable
+    else
+        local iface
+        iface=$(jq -r .iface <<< "$state")
+        if pacing_locked pacing_apply_rate "$iface" "$PACING_INPUT_RATE"; then
+            pacing_enable_autostart "$iface" "$PACING_INPUT_RATE"
+            return $?
+        fi
+        return 1
+    fi
+}
+
+pacing_disable_all() {
+    pacing_disable_autostart || { pacing_error "无法关闭开机恢复，未修改当前限速。"; return 1; }
+    pacing_locked pacing_disable
 }
 
 pacing_status_summary() {
-    local state iface root
-    echo "每流限速只在本次启动、当前网卡生命周期内生效。"
+    local state iface root policy
+    if policy=$(pacing_read_policy); then
+        echo "开机自动恢复: 已启用 ($(jq -r .iface <<< "$policy") / $(pacing_human_rate "$(jq -r .rate <<< "$policy")"))"
+    elif [[ -f "$PACING_POLICY_FILE" ]]; then
+        echo "开机自动恢复: 策略损坏，请先关闭限速后重新设置。"
+    else
+        echo "开机自动恢复: 未启用。"
+    fi
+    echo "系统会在开机网络就绪后恢复；网卡被运行时重建时仍需重新设置。"
     if state=$(pacing_read_state); then
         iface=$(jq -r .iface <<< "$state")
         echo "保存记录: $iface / $(jq -r .phase <<< "$state") / $(pacing_human_rate "$(jq -r .rate <<< "$state")")"
@@ -11793,7 +11939,7 @@ manage_tcp_pacing_limit() {
         read -r -p "请选择: " choice || return
         case "$choice" in
             1) pacing_enable_all;; 2) pacing_modify_rate;; 3) pacing_view_realtime;;
-            4) pacing_locked pacing_disable;; 5) pacing_locked pacing_legacy_cleanup;;
+            4) pacing_disable_all;; 5) pacing_locked pacing_legacy_cleanup;;
             6) pacing_locked pacing_forget_stale;; 0) return;; *) echo "无效选项";;
         esac
         break_end
@@ -18921,6 +19067,11 @@ parse_args() {
                     echo "安装完成后，请重启系统以加载新内核"
                 fi
                 exit 0
+                ;;
+            --restore-pacing)
+                check_root
+                pacing_locked pacing_restore_boot
+                exit $?
                 ;;
             --debug)
                 LOG_LEVEL="DEBUG"
