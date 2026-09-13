@@ -7200,7 +7200,7 @@ show_main_menu() {
     echo "37. 科技lion高性能模式"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━ 流量整形 ━━━━━━━━━━${gl_bai}"
-    echo "39. TCP单连接限速管理（FQ + Pacing） 游戏优化 ⭐ 推荐"
+    echo "39. FQ每流限速管理（保留现有TCP参数）"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━ AI 代理服务 ━━━━━━━━━${gl_bai}"
     echo "38. AI代理工具箱 ▶ (Claude/WebUI/CRS/Fuclaude/Caddy) ⭐ 推荐"
@@ -11375,534 +11375,393 @@ remove_bbr_lotserver() {
 }
 
 #=============================================================================
-# TCP 单连接限速管理（FQ qdisc maxrate）
-# 适用场景：3x-ui (x-ui) / Xray / Snell 等基于 TCP 的代理，按"每个 flow"限速
-# 核心原理：
-#   1. Linux 内核 FQ 调度器按 flow 公平排队
-#   2. FQ 的 maxrate 参数对每个 flow 设置最大发送速率
-#   3. 该方案不依赖应用进程实现，适合 Xray/3x-ui 这类 Go 程序
-# 注意：
-#   1. 限速作用于网卡发送方向（服务器 -> 外部），即用户下载/节点出站
-#   2. fq maxrate 是网卡级策略，会影响该服务器所有经过该网卡的出站 flow
-#=============================================================================
-
+# TCP/FQ 每流限速：仅修改选定的现有根 FQ，不调整全局 TCP 参数。
 PACING_CONFIG_FILE="/etc/net-tcp-tune-pacing.conf"
-PACING_LIB_PATH="/usr/local/lib/libpacing.so"
-PACING_SRC_PATH="/usr/local/src/libpacing.c"
 PACING_SYSCTL_FILE="/etc/sysctl.d/99-game-pacing.conf"
-PACING_DEFAULT_TARGETS="x-ui xray"
+PACING_LOCK_FILE="/run/net-tcp-tune-pacing.lock"
 
-pacing_load_config() {
-    PACING_ENABLED=0
-    PACING_RATE_BPS=0
-    PACING_TARGETS="x-ui"
-    GAME_MODE=0
-    if [ -f "$PACING_CONFIG_FILE" ]; then
-        # shellcheck disable=SC1090
-        source "$PACING_CONFIG_FILE"
-    fi
+pacing_error() { echo "错误: $*" >&2; }
+
+pacing_dependencies() {
+    local tool
+    for tool in tc ip jq flock mktemp; do
+        command -v "$tool" >/dev/null || {
+            pacing_error "缺少 $tool；Debian 请安装 iproute2 jq util-linux。"
+            return 1
+        }
+    done
 }
 
-pacing_save_config() {
-    cat > "$PACING_CONFIG_FILE" <<EOF
-# TCP 单连接限速配置 (由 net-tcp-tune.sh 自动管理)
-PACING_ENABLED=${PACING_ENABLED:-0}
-PACING_RATE_BPS=${PACING_RATE_BPS:-0}
-PACING_TARGETS="${PACING_TARGETS:-x-ui}"
-GAME_MODE=${GAME_MODE:-0}
-EOF
-    chmod 644 "$PACING_CONFIG_FILE"
+# maxrate 的 netlink 字段为 u32 字节/秒，UINT32_MAX 表示无限制。
+pacing_valid_rate() {
+    [[ "$1" =~ ^[0-9]{1,10}$ ]] && (( 10#$1 <= 4294967295 ))
+}
+
+pacing_parse_rate() {
+    local input="$1" num unit factor
+    [[ "$input" =~ ^([0-9]+)([KkMmGg]?)$ ]] || return 1
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    while [[ ${#num} -gt 1 && "$num" == 0* ]]; do num="${num#0}"; done
+    [[ ${#num} -le 10 ]] || return 1
+    case "$unit" in
+        M|m) factor=1048576;; G|g) factor=1073741824;; *) factor=1024;;
+    esac
+    # 在乘法前校验，避免 Bash 整数溢出；强制十进制，接受 08M。
+    (( 10#$num <= 4294967294 / factor )) || return 1
+    printf '%s\n' "$((10#$num * factor))"
 }
 
 pacing_human_rate() {
-    local bps="$1"
-    if [ "$bps" -le 0 ] 2>/dev/null; then
-        echo "未设置"
-        return
-    fi
-    if [ "$bps" -ge 1048576 ]; then
-        awk -v b="$bps" 'BEGIN{printf "%.2f MB/s (%.0f Mbps)\n", b/1048576, b*8/1000000}'
-    elif [ "$bps" -ge 1024 ]; then
-        awk -v b="$bps" 'BEGIN{printf "%.2f KB/s (%.2f Mbps)\n", b/1024, b*8/1000000}'
+    if [[ "$1" == 0 || "$1" == 4294967295 ]]; then
+        echo "无限制"
     else
-        echo "${bps} B/s"
+        awk -v b="$1" 'BEGIN {printf "%.2f MiB/s (%.2f Mbps)\n",b/1048576,b*8/1000000}'
     fi
-}
-
-pacing_check_gcc() {
-    if ! command -v gcc >/dev/null 2>&1; then
-        echo -e "${gl_huang}未检测到 gcc，正在安装编译工具...${gl_bai}"
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq && apt-get install -y gcc libc6-dev >/dev/null 2>&1
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y gcc glibc-devel >/dev/null 2>&1
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y gcc glibc-devel >/dev/null 2>&1
-        fi
-    fi
-    command -v gcc >/dev/null 2>&1
-}
-
-pacing_write_lib_source() {
-    mkdir -p "$(dirname "$PACING_SRC_PATH")"
-    cat > "$PACING_SRC_PATH" <<'PACING_C_EOF'
-#define _GNU_SOURCE
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <dlfcn.h>
-#include <stdlib.h>
-#include <string.h>
-
-#ifndef SO_MAX_PACING_RATE
-#define SO_MAX_PACING_RATE 47
-#endif
-
-typedef int (*accept_fn)(int, struct sockaddr*, socklen_t*);
-typedef int (*accept4_fn)(int, struct sockaddr*, socklen_t*, int);
-
-static unsigned long pacing_get_rate(void) {
-    const char *e = getenv("PACING_RATE_BPS");
-    if (!e || !*e) return 0UL;
-    return strtoul(e, NULL, 10);
-}
-
-static void pacing_apply(int fd) {
-    if (fd < 0) return;
-    unsigned long rate = pacing_get_rate();
-    if (rate == 0UL) return;
-    /* SO_MAX_PACING_RATE 在内核中按字节/秒生效，仅作用于发送方向 */
-    (void)setsockopt(fd, SOL_SOCKET, SO_MAX_PACING_RATE, &rate, sizeof(rate));
-}
-
-int accept(int s, struct sockaddr *addr, socklen_t *len) {
-    static accept_fn orig = NULL;
-    if (!orig) orig = (accept_fn)dlsym(RTLD_NEXT, "accept");
-    int fd = orig(s, addr, len);
-    pacing_apply(fd);
-    return fd;
-}
-
-int accept4(int s, struct sockaddr *addr, socklen_t *len, int flags) {
-    static accept4_fn orig = NULL;
-    if (!orig) orig = (accept4_fn)dlsym(RTLD_NEXT, "accept4");
-    int fd = orig(s, addr, len, flags);
-    pacing_apply(fd);
-    return fd;
-}
-PACING_C_EOF
-}
-
-pacing_compile_lib() {
-    pacing_check_gcc || { echo -e "${gl_hong}gcc 安装失败，无法编译限速库${gl_bai}"; return 1; }
-    pacing_write_lib_source
-    mkdir -p "$(dirname "$PACING_LIB_PATH")"
-    if gcc -O2 -shared -fPIC -o "$PACING_LIB_PATH" "$PACING_SRC_PATH" -ldl 2>/tmp/pacing_build.log; then
-        chmod 755 "$PACING_LIB_PATH"
-        echo -e "${gl_lv}✅ 限速动态库编译成功: ${PACING_LIB_PATH}${gl_bai}"
-        return 0
-    else
-        echo -e "${gl_hong}❌ 编译失败，错误日志:${gl_bai}"
-        cat /tmp/pacing_build.log
-        return 1
-    fi
-}
-
-pacing_apply_sysctl() {
-    cat > "$PACING_SYSCTL_FILE" <<'EOF'
-# === 由 net-tcp-tune.sh 写入：FQ + BBR + 游戏延迟优化 ===
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# 游戏延迟关键：关闭空闲后慢启动（长连接保活时不重置 cwnd）
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# TCP Fast Open（客户端+服务端均启用）
-net.ipv4.tcp_fastopen = 3
-
-# TIME_WAIT 复用，避免端口耗尽
-net.ipv4.tcp_tw_reuse = 1
-
-# 游戏加速场景：进一步减小默认/最大 buffer，降低内存占用和 bufferbloat
-net.ipv4.tcp_rmem = 4096 16384 524288
-net.ipv4.tcp_wmem = 4096 16384 524288
-
-# 提高 backlog，应对短时间大量握手
-net.core.somaxconn = 32768
-net.ipv4.tcp_max_syn_backlog = 32768
-EOF
-    sysctl -p "$PACING_SYSCTL_FILE" >/dev/null 2>&1
-    echo -e "${gl_lv}✅ 已写入 sysctl: ${PACING_SYSCTL_FILE}${gl_bai}"
-
-    # 给所有非 lo 网卡挂上 fq（未启用限速时不设置 maxrate）
-    local iface
-    for iface in $(ls /sys/class/net 2>/dev/null); do
-        [ "$iface" = "lo" ] && continue
-        [ -d "/sys/class/net/$iface" ] || continue
-        if tc qdisc replace dev "$iface" root fq 2>/dev/null; then
-            echo -e "  ${gl_lv}✓${gl_bai} ${iface}: fq qdisc 已启用"
-        fi
-    done
-}
-
-pacing_rate_to_tc_kbit() {
-    local rate_bps="$1"
-    local rate_kbit=$((rate_bps * 8 / 1000))
-    [ "$rate_kbit" -lt 1 ] && rate_kbit=1
-    echo "${rate_kbit}kbit"
-}
-
-pacing_apply_fq_maxrate() {
-    local rate_bps="$1"
-    local tc_rate
-    tc_rate=$(pacing_rate_to_tc_kbit "$rate_bps")
-
-    local iface applied=0
-    for iface in $(ls /sys/class/net 2>/dev/null); do
-        [ "$iface" = "lo" ] && continue
-        [ -d "/sys/class/net/$iface" ] || continue
-        if tc qdisc replace dev "$iface" root fq maxrate "$tc_rate" 2>/dev/null; then
-            echo -e "  ${gl_lv}✓${gl_bai} ${iface}: fq maxrate ${tc_rate} 已启用（每 flow）"
-            applied=1
-        else
-            echo -e "  ${gl_huang}⚠️${gl_bai} ${iface}: fq maxrate 设置失败，可能是内核或容器不支持"
-        fi
-    done
-
-    [ "$applied" = "1" ]
-}
-
-pacing_clear_fq_maxrate() {
-    local iface
-    for iface in $(ls /sys/class/net 2>/dev/null); do
-        [ "$iface" = "lo" ] && continue
-        [ -d "/sys/class/net/$iface" ] || continue
-        tc qdisc replace dev "$iface" root fq 2>/dev/null
-    done
-}
-
-pacing_remove_sysctl() {
-    [ -f "$PACING_SYSCTL_FILE" ] && rm -f "$PACING_SYSCTL_FILE"
-    sysctl --system >/dev/null 2>&1
-    echo -e "${gl_huang}已移除游戏优化 sysctl 配置（重启后完全恢复默认）${gl_bai}"
-}
-
-pacing_inject_service() {
-    local svc="$1"
-    local rate_bps="$2"
-    if ! systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
-        echo -e "  ${gl_huang}⚠️  服务 ${svc}.service 不存在，跳过${gl_bai}"
-        return 1
-    fi
-    local dropin_dir="/etc/systemd/system/${svc}.service.d"
-    mkdir -p "$dropin_dir"
-    cat > "${dropin_dir}/pacing.conf" <<EOF
-# 由 net-tcp-tune.sh 自动写入：注入 LD_PRELOAD 实现每连接限速
-[Service]
-Environment="LD_PRELOAD=${PACING_LIB_PATH}"
-Environment="PACING_RATE_BPS=${rate_bps}"
-EOF
-    systemctl daemon-reload
-    if systemctl is-active --quiet "$svc"; then
-        systemctl restart "$svc"
-        echo -e "  ${gl_lv}✓${gl_bai} ${svc}: 限速已注入并重启服务"
-    else
-        echo -e "  ${gl_huang}○${gl_bai} ${svc}: 已写入注入配置（服务未运行，下次启动生效）"
-    fi
-    return 0
-}
-
-pacing_remove_inject() {
-    local svc="$1"
-    local dropin="/etc/systemd/system/${svc}.service.d/pacing.conf"
-    if [ -f "$dropin" ]; then
-        rm -f "$dropin"
-        rmdir "/etc/systemd/system/${svc}.service.d" 2>/dev/null
-        systemctl daemon-reload
-        if systemctl is-active --quiet "$svc"; then
-            systemctl restart "$svc"
-            echo -e "  ${gl_lv}✓${gl_bai} ${svc}: 已移除限速注入并重启"
-        else
-            echo -e "  ${gl_huang}○${gl_bai} ${svc}: 已移除限速注入"
-        fi
-    fi
-}
-
-pacing_status_summary() {
-    pacing_load_config
-    local fq_enabled="未启用"
-    local bbr_enabled="未启用"
-    local main_iface
-    main_iface=$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')
-    [ -z "$main_iface" ] && main_iface="eth0"
-    if tc qdisc show dev "$main_iface" 2>/dev/null | grep -q "qdisc fq "; then
-        fq_enabled="${gl_lv}已启用 (${main_iface})${gl_bai}"
-    else
-        fq_enabled="${gl_huang}未启用 (${main_iface} 当前为 $(tc qdisc show dev "$main_iface" 2>/dev/null | awk '{print $2}' | head -1))${gl_bai}"
-    fi
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
-        bbr_enabled="${gl_lv}已启用${gl_bai}"
-    else
-        bbr_enabled="${gl_huang}未启用 (当前: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null))${gl_bai}"
-    fi
-
-    echo -e "${gl_kjlan}━━━━━━━━━━ 当前状态 ━━━━━━━━━━${gl_bai}"
-    echo -e "  FQ 调度器:        ${fq_enabled}"
-    echo -e "  BBR 拥塞控制:     ${bbr_enabled}"
-    echo -e "  限速方式:         ${gl_lv}FQ qdisc maxrate（网卡级，每 flow）${gl_bai}"
-    echo -e "  限速总开关:       $([ "${PACING_ENABLED:-0}" = "1" ] && echo "${gl_lv}启用${gl_bai}" || echo "${gl_huang}未启用${gl_bai}")"
-    echo -e "  当前限速值:       ${gl_huang}$(pacing_human_rate "${PACING_RATE_BPS:-0}")${gl_bai}"
-    echo -e "  作用范围:         ${gl_huang}所有非 lo 网卡的出站 flow${gl_bai}"
-    echo -e "  游戏优化模式:     $([ "${GAME_MODE:-0}" = "1" ] && echo "${gl_lv}启用${gl_bai}" || echo "${gl_huang}未启用${gl_bai}")"
-    echo -e "  网卡规则:         ${gl_huang}$(tc qdisc show dev "$main_iface" 2>/dev/null | head -1)${gl_bai}"
-    echo ""
 }
 
 pacing_input_rate() {
-    echo ""
-    echo -e "${gl_kjlan}请输入每个 TCP 连接的限速值${gl_bai}"
-    echo "  支持单位: K (KB/s), M (MB/s), 纯数字默认按 KB/s"
-    echo "  示例:"
-    echo "    10M    → 10 MB/s 每连接（80 Mbps，游戏推荐：永远不会触发限速）"
-    echo "    1M     → 1 MB/s 每连接（8 Mbps，普通代理够用）"
-    echo "    500    → 500 KB/s 每连接（4 Mbps）"
-    echo "    0      → 取消限速（不设置上限）"
-    echo ""
-    read -e -p "请输入限速值 [默认 10M]: " rate_input
-    rate_input="${rate_input:-10M}"
+    local input
+    echo "单位 K/M/G = KiB/MiB/GiB 每秒；纯数字为 KiB/s。0 = 关闭本功能。"
+    read -r -p "每流上限（例如 10M；回车取消）: " input || return 1
+    [[ -n "$input" ]] || return 1
+    PACING_INPUT_RATE=$(pacing_parse_rate "$input") || {
+        pacing_error "请输入有效整数速率，且小于 4 GiB/s。"; return 1;
+    }
+}
 
-    local num unit bps
-    if [[ "$rate_input" =~ ^([0-9]+)([KkMmGg]?)$ ]]; then
-        num="${BASH_REMATCH[1]}"
-        unit="${BASH_REMATCH[2]}"
-        case "$unit" in
-            K|k|"") bps=$((num * 1024)) ;;
-            M|m)    bps=$((num * 1024 * 1024)) ;;
-            G|g)    bps=$((num * 1024 * 1024 * 1024)) ;;
-        esac
-    else
-        echo -e "${gl_hong}❌ 无效的格式${gl_bai}"
+pacing_boot_id() { cat /proc/sys/kernel/random/boot_id; }
+pacing_ifindex() { cat "/sys/class/net/$1/ifindex"; }
+
+pacing_read_root() {
+    local data
+    data=$(tc -j qdisc show dev "$1") || return 1
+    jq -ce '[.[] | select(.root == true)] | if length == 1 then .[0] else error("根队列不唯一") end' <<< "$data"
+}
+
+pacing_root_rate() {
+    jq -er '.options.maxrate // 4294967295' <<< "$1"
+}
+
+pacing_require_fq() {
+    jq -e '.kind == "fq" and (.options | type == "object") and .options.pacing != false' <<< "$1" >/dev/null || {
+        pacing_error "仅支持已启用 pacing 的根 FQ；不会覆盖 CAKE/HTB/mq/FQ_CoDel 等队列。"
         return 1
+    }
+}
+
+pacing_write_state() {
+    local data="$1" tmp
+    tmp=$(mktemp "${PACING_CONFIG_FILE}.tmp.XXXXXX") || return 1
+    if printf '%s\n' "$data" > "$tmp" && chmod 600 "$tmp" && mv -f -- "$tmp" "$PACING_CONFIG_FILE"; then
+        return 0
     fi
-
-    PACING_RATE_BPS="$bps"
-    echo -e "${gl_lv}已解析为: $(pacing_human_rate "$bps")${gl_bai}"
-    return 0
+    rm -f -- "$tmp"
+    return 1
 }
 
-pacing_input_targets() {
-    echo ""
-    echo -e "${gl_kjlan}请选择要限速的服务（多个用空格分隔）${gl_bai}"
-    echo "  常见服务名:"
-    echo "    x-ui    → 3x-ui 面板（推荐）"
-    echo "    xray    → 独立 Xray"
-    echo "    snell   → Snell 服务"
-    echo ""
-    read -e -p "请输入服务名 [默认 x-ui]: " tgt_input
-    PACING_TARGETS="${tgt_input:-x-ui}"
-    echo -e "${gl_lv}目标服务: ${PACING_TARGETS}${gl_bai}"
+pacing_read_state() {
+    [[ -f "$PACING_CONFIG_FILE" ]] || return 1
+    # 旧版 shell 配置只检测不 source，避免执行配置内容。
+    jq -ce 'select(.version == 2 and (.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and
+        (.handle | test("^[0-9a-fA-F]+:$")) and (.boot | type == "string") and
+        (.ifindex | test("^[0-9]+$")) and
+        (.original == 4294967295) and
+        (.rate | type == "number" and . > 0 and . < 4294967295 and . == floor) and
+        ((has("previous_rate") | not) or
+          (.previous_rate | type == "number" and . > 0 and . <= 4294967295 and . == floor)) and
+        (.phase == "active" or .phase == "pending"))' "$PACING_CONFIG_FILE" 2>/dev/null
 }
+
+pacing_same_device() {
+    local state="$1" root="$2" iface
+    iface=$(jq -r .iface <<< "$state")
+    [[ $(pacing_boot_id) == "$(jq -r .boot <<< "$state")" &&
+       $(pacing_ifindex "$iface") == "$(jq -r .ifindex <<< "$state")" &&
+       $(jq -r .handle <<< "$root") == "$(jq -r .handle <<< "$state")" ]] || {
+        pacing_error "网卡、队列或系统启动标识已变化；停止修改，请查看实际状态。"
+        return 1
+    }
+}
+
+pacing_set_rate() {
+    local iface="$1" rate="$2" expected_state="${3:-}" allowed_rates="${4:-}" root current
+    local -a handle_args=()
+    pacing_valid_rate "$rate" || return 1
+    # 显式写入 UINT32_MAX 清除上限；不要依赖 replace fq 的省略参数行为。
+    if [[ -n "$expected_state" ]]; then
+        root=$(pacing_read_root "$iface") || return 1
+        pacing_require_fq "$root" || return 1
+        pacing_same_device "$expected_state" "$root" || return 1
+        if [[ -n "$allowed_rates" ]]; then
+            current=$(pacing_root_rate "$root") || return 1
+            case " $allowed_rates " in
+                *" $current "*) ;;
+                *) pacing_error "$iface 上限已变化，停止修改并保留记录。"; return 1;;
+            esac
+        fi
+        handle_args=(handle "$(jq -r .handle <<< "$expected_state")")
+    fi
+    tc qdisc change dev "$iface" root "${handle_args[@]}" fq maxrate "$((10#$rate * 8))bit" || return 1
+    root=$(pacing_read_root "$iface") || return 1
+    pacing_require_fq "$root" || return 1
+    if [[ -n "$expected_state" ]]; then
+        pacing_same_device "$expected_state" "$root" || return 1
+    fi
+    [[ $(pacing_root_rate "$root") == "$rate" ]] || {
+        pacing_error "$iface 限速读回与请求不符。"; return 1;
+    }
+}
+
+# 每次只管理一张明确选择的接口，修改前写恢复记录，失败恢复原速率。
+pacing_apply_rate() {
+    local iface="$1" rate="$2" root before old="" original state phase boot ifindex handle
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
+    pacing_valid_rate "$rate" && (( rate > 0 && rate < 4294967295 )) || return 1
+    [[ ! -f "$PACING_SYSCTL_FILE" ]] || {
+        pacing_error "检测到旧版全局调优配置，请先选择 [5] 旧版清理。"; return 1;
+    }
+    root=$(pacing_read_root "$iface") || return 1
+    pacing_require_fq "$root" || return 1
+    boot=$(pacing_boot_id) && [[ -n "$boot" ]] || return 1
+    ifindex=$(pacing_ifindex "$iface") && [[ "$ifindex" =~ ^[0-9]+$ ]] || return 1
+    handle=$(jq -r .handle <<< "$root")
+    [[ "$handle" =~ ^[0-9a-fA-F]+:$ ]] || return 1
+    [[ "$handle" != "0:" ]] || {
+        pacing_error "这是内核默认根 FQ（handle 0）；不会隐式替换它。请先手动建立带非零 handle 的根 FQ 后重试。"; return 1;
+    }
+    before=$(pacing_root_rate "$root") || return 1
+    pacing_valid_rate "$before" || return 1
+    original="$before"
+    if [[ -f "$PACING_CONFIG_FILE" ]]; then
+        old=$(pacing_read_state) || { pacing_error "配置为旧版或损坏，请先处理。"; return 1; }
+        [[ $(jq -r .iface <<< "$old") == "$iface" ]] || {
+            pacing_error "请先关闭原接口的限速。"; return 1;
+        }
+        pacing_same_device "$old" "$root" || return 1
+        phase=$(jq -r .phase <<< "$old")
+        [[ "$phase" == active && "$before" == "$(jq -r .rate <<< "$old")" ]] || {
+            pacing_error "存在未完成操作或外部修改，请先查看状态并关闭。"; return 1;
+        }
+        original=$(jq -r .original <<< "$old")
+    elif [[ "$before" != 4294967295 ]]; then
+        pacing_error "该接口已有非本功能设置的上限，请先核对或清理旧版。"; return 1
+    fi
+    state=$(jq -cn --arg iface "$iface" --arg boot "$boot" \
+        --arg ifindex "$ifindex" --arg handle "$handle" \
+        --argjson rate "$rate" --argjson original "$original" --argjson previous "$before" \
+        '{version:2,iface:$iface,boot:$boot,ifindex:$ifindex,handle:$handle,
+          original:$original,previous_rate:$previous,rate:$rate,phase:"pending"}') || return 1
+    pacing_write_state "$state" || return 1
+    if pacing_set_rate "$iface" "$rate" "$state" "$before" &&
+       pacing_write_state "$(jq -c '.phase="active"' <<< "$state")"; then
+        echo "已验证 $iface 每流上限: $(pacing_human_rate "$rate")"
+        return 0
+    fi
+    pacing_error "应用或保存失败，尝试恢复变更前速率。"
+    if pacing_set_rate "$iface" "$before" "$state" "$before $rate"; then
+        if [[ -n "$old" ]]; then pacing_write_state "$old" || return 1
+        else rm -f -- "$PACING_CONFIG_FILE" || return 1; fi
+    else
+        pacing_error "回滚失败，保留恢复记录；请查看状态并选择 [4]。"
+    fi
+    return 1
+}
+
+pacing_disable() {
+    local state iface root original current allowed
+    [[ -f "$PACING_CONFIG_FILE" ]] || { echo "没有本版本的限速记录。"; return 0; }
+    state=$(pacing_read_state) || { pacing_error "旧版配置请使用 [5] 清理。"; return 1; }
+    iface=$(jq -r .iface <<< "$state")
+    root=$(pacing_read_root "$iface") || return 1
+    pacing_require_fq "$root" || return 1
+    pacing_same_device "$state" "$root" || return 1
+    original=$(jq -r .original <<< "$state")
+    current=$(pacing_root_rate "$root") || return 1
+    allowed="$original $(jq -r .rate <<< "$state")"
+    if [[ $(jq -r .phase <<< "$state") == pending ]]; then
+        allowed="$allowed $(jq -r '.previous_rate // .original' <<< "$state")"
+    fi
+    case " $allowed " in
+        *" $current "*) ;;
+        *) pacing_error "上限已被其他工具修改，保留记录，请人工核对。"; return 1;;
+    esac
+    pacing_set_rate "$iface" "$original" "$state" "$allowed" || return 1
+    rm -f -- "$PACING_CONFIG_FILE" || return 1
+    echo "已验证 $iface 恢复为 $(pacing_human_rate "$original")；其他队列和 TCP 参数保持原值。"
+}
+
+pacing_locked() (
+    pacing_dependencies || exit 1
+    exec 9>"$PACING_LOCK_FILE" || exit 1
+    flock -n 9 || { pacing_error "另一个限速操作正在执行。"; exit 1; }
+    "$@"
+)
 
 pacing_enable_all() {
-    clear
-    echo -e "${gl_kjlan}=== 一键启用 TCP 单连接限速 ===${gl_bai}"
-    echo ""
-
-    # 1. 输入限速值
-    pacing_input_rate || { break_end; return; }
-
-    # 2. 是否启用游戏优化
-    echo ""
-    read -e -p "是否启用游戏延迟优化（小buffer + 关闭慢启动重启）? [Y/n]: " game_choice
-    if [[ ! "$game_choice" =~ ^[Nn]$ ]]; then
-        GAME_MODE=1
-    else
-        GAME_MODE=0
-    fi
-
-    echo ""
-    echo -e "${gl_kjlan}━━━━━━━━━━ 开始执行 ━━━━━━━━━━${gl_bai}"
-
-    # 3. 应用 sysctl + FQ
-    echo -e "${gl_kjlan}[1/2] 配置 FQ 调度器 + BBR + 系统参数...${gl_bai}"
-    pacing_apply_sysctl
-
-    # 4. 应用 fq maxrate
-    echo ""
-    echo -e "${gl_kjlan}[2/2] 配置 FQ maxrate（每 flow 限速）...${gl_bai}"
-    if ! pacing_apply_fq_maxrate "$PACING_RATE_BPS"; then
-        echo -e "${gl_hong}fq maxrate 设置失败，已中止${gl_bai}"
-        break_end
-        return
-    fi
-
-    # 清理旧版本可能写入的 LD_PRELOAD 注入，避免误导状态
-    local svc
-    for svc in ${PACING_TARGETS:-x-ui} x-ui xray snell; do
-        pacing_remove_inject "$svc"
-    done
-
-    PACING_ENABLED=1
-    PACING_TARGETS="all-ifaces"
-    pacing_save_config
-
-    echo ""
-    echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-    echo -e "${gl_lv}✅ TCP 单连接限速已启用${gl_bai}"
-    echo -e "${gl_lv}   每连接上限: $(pacing_human_rate "$PACING_RATE_BPS")${gl_bai}"
-    echo -e "${gl_lv}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-    echo ""
-    echo -e "${gl_huang}验证方法:${gl_bai}"
-    echo "  1. 让用户连接 3x-ui 节点并下载文件"
-    echo "  2. 在服务器执行: tc qdisc show dev eth0"
-    echo "  3. 应能看到: qdisc fq ... maxrate <你的限速值>"
-    echo ""
-    break_end
+    local iface
+    pacing_input_rate || return 1
+    if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_locked pacing_disable; return $?; fi
+    ip -br link
+    echo "仅对所选接口现有根 FQ 设置每流上限；包含该接口上的 TCP/UDP 等出站流量。"
+    echo "不会设置 BBR、缩小缓冲区或覆盖其他队列；速率不自动跨重启/接口重建恢复。"
+    read -r -p "请输入要限速的网卡（回车取消）: " iface || return 1
+    [[ -n "$iface" ]] || return 1
+    pacing_locked pacing_apply_rate "$iface" "$PACING_INPUT_RATE"
 }
 
 pacing_modify_rate() {
-    pacing_load_config
-    if [ "${PACING_ENABLED:-0}" != "1" ]; then
-        echo -e "${gl_huang}限速尚未启用，请先选择 [1] 一键启用${gl_bai}"
-        break_end
-        return
+    local state
+    state=$(pacing_read_state) || { pacing_error "没有可修改的本版本配置。"; return 1; }
+    pacing_input_rate || return 1
+    if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_locked pacing_disable
+    else pacing_locked pacing_apply_rate "$(jq -r .iface <<< "$state")" "$PACING_INPUT_RATE"; fi
+}
+
+pacing_status_summary() {
+    local state iface root
+    echo "每流限速只在本次启动、当前网卡生命周期内生效。"
+    if state=$(pacing_read_state); then
+        iface=$(jq -r .iface <<< "$state")
+        echo "保存记录: $iface / $(jq -r .phase <<< "$state") / $(pacing_human_rate "$(jq -r .rate <<< "$state")")"
+        if root=$(pacing_read_root "$iface") && pacing_require_fq "$root" && pacing_same_device "$state" "$root"; then
+            echo "内核当前上限: $(pacing_human_rate "$(pacing_root_rate "$root")")"
+            [[ $(jq -r .phase <<< "$state") == active &&
+               $(pacing_root_rate "$root") == "$(jq -r .rate <<< "$state")" ]] || echo "记录与内核不一致或操作未完成。"
+        else echo "记录已过期或无法读取，不能认定限速生效。"; fi
+    elif [[ -f "$PACING_CONFIG_FILE" ]]; then
+        echo "检测到旧版/损坏的配置；未执行其内容。"
+    else echo "无本版本限速记录；实际队列请通过 [3] 查看。"; fi
+    if [[ -f "$PACING_SYSCTL_FILE" ]]; then
+        echo "旧版全局 TCP 调优配置仍存在，请通过 [5] 清理。"
     fi
-    pacing_input_rate || { break_end; return; }
-    echo ""
-    echo -e "${gl_kjlan}重新配置 FQ maxrate...${gl_bai}"
-    pacing_apply_fq_maxrate "$PACING_RATE_BPS" || { break_end; return; }
-    pacing_save_config
-    echo ""
-    echo -e "${gl_lv}✅ 限速值已更新为: $(pacing_human_rate "$PACING_RATE_BPS")${gl_bai}"
-    break_end
 }
 
 pacing_view_realtime() {
-    clear
-    echo -e "${gl_kjlan}=== 实时连接/网卡限速状态 ===${gl_bai}"
-    echo ""
-    if ! command -v ss >/dev/null 2>&1; then
-        echo -e "${gl_hong}缺少 ss 命令${gl_bai}"
-        break_end
-        return
-    fi
-    echo -e "${gl_kjlan}[1] 当前网卡 qdisc:${gl_bai}"
-    local iface
-    for iface in $(ls /sys/class/net 2>/dev/null); do
-        [ "$iface" = "lo" ] && continue
-        tc qdisc show dev "$iface" 2>/dev/null | sed "s/^/  [$iface] /"
+    local path iface
+    for path in /sys/class/net/*; do
+        iface=${path##*/}; [[ "$iface" == lo ]] && continue
+        tc -s -d qdisc show dev "$iface"
     done
-    echo ""
-    echo -e "${gl_kjlan}[2] 当前 TCP 连接发送状态（前 30 条，仅辅助观察）:${gl_bai}"
-    echo "格式: <对端地址>  pacing_rate=<内核估计>  send=<当前发送速率>"
-    echo "------------------------------------------------"
-    ss -tinH 2>/dev/null | awk '
-        /^ESTAB/ {peer=$5; next}
-        /pacing_rate/ {
-            for(i=1;i<=NF;i++){
-                if($i ~ /pacing_rate/){pr=$i}
-                if($i ~ /^send/){sd=$i}
-            }
-            printf "%-45s  %s  %s\n", peer, pr, sd
-            pr=""; sd=""
+    echo "TCP 信息（send/pacing_rate 是内核估计，不是实际吞吐测速）："
+    ss -tinm | head -n 100
+    sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_congestion_control
+}
+
+# 旧版没有原值备份：仅撤销有明确脚本标记的持久配置，不猜测运行参数。
+pacing_legacy_cleanup() {
+    local answer expected raw path iface root rate stamp backup boot ifindex conf_exists=0 mismatch=0 i
+    local -a planned=() snapshots=()
+    [[ -f "$PACING_CONFIG_FILE" || -f "$PACING_SYSCTL_FILE" ]] || { echo "没有旧版文件。"; return 0; }
+    if [[ -f "$PACING_CONFIG_FILE" ]]; then
+        pacing_read_state >/dev/null && { pacing_error "这是本版本记录，请使用 [4]。"; return 1; }
+        grep -q '^# TCP 单连接限速配置 (由 net-tcp-tune.sh 自动管理)' "$PACING_CONFIG_FILE" || {
+            pacing_error "无法确认配置来源，未执行清理。"; return 1;
         }
-    ' | head -30
-
-    echo ""
-    echo -e "${gl_huang}说明:${gl_bai}"
-    echo "  - 本版本使用 fq maxrate，真实限速以 tc qdisc 中的 maxrate 为准"
-    echo "  - ss 中的 pacing_rate 是 BBR/FQ 对 socket 的动态估计值，不再要求等于限速值"
-    echo "  - 测速请用客户端通过 vmess 下载测速，不要用服务器本地测速"
-    echo ""
-    break_end
-}
-
-pacing_disable_keep_fq() {
-    pacing_load_config
-    echo -e "${gl_kjlan}正在关闭限速（保留 FQ + BBR + 游戏优化）...${gl_bai}"
-    local svc
-    for svc in $PACING_TARGETS; do
-        pacing_remove_inject "$svc"
-    done
-    pacing_clear_fq_maxrate
-    PACING_ENABLED=0
-    PACING_RATE_BPS=0
-    pacing_save_config
-    echo ""
-    echo -e "${gl_lv}✅ 限速已关闭，但 FQ/BBR/sysctl 优化保留${gl_bai}"
-    echo -e "${gl_huang}如需完全卸载请选择 [6] 完全卸载${gl_bai}"
-    break_end
-}
-
-pacing_full_uninstall() {
-    pacing_load_config
-    echo -e "${gl_huang}=== 完全卸载 TCP 单连接限速 ===${gl_bai}"
-    echo "将执行:"
-    echo "  1. 移除所有服务的 LD_PRELOAD 注入"
-    echo "  2. 删除 ${PACING_LIB_PATH}"
-    echo "  3. 删除 ${PACING_SYSCTL_FILE}"
-    echo "  4. 删除 ${PACING_CONFIG_FILE}"
-    echo "  5. 恢复默认 qdisc（重启彻底生效）"
-    echo ""
-    read -e -p "确认卸载? [y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "已取消"
-        break_end
-        return
+        conf_exists=1
     fi
-
-    local svc
-    for svc in $PACING_TARGETS x-ui xray snell; do
-        pacing_remove_inject "$svc"
+    if [[ -f "$PACING_SYSCTL_FILE" ]]; then
+        grep -q '^# === 由 net-tcp-tune.sh 写入：FQ + BBR + 游戏延迟优化 ===' "$PACING_SYSCTL_FILE" || return 1
+    fi
+    echo "将归档旧版配置，并清除与旧版保存速率相符的根 FQ 上限。"
+    echo "旧版未保存原 TCP 参数；512 KiB 等运行值不会凭空恢复。"
+    echo "归档后需按已知基线恢复参数，或安排重启重新加载系统配置；本操作不重启。"
+    read -r -p "确认清理旧版？[y/N]: " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 1
+    expected=""
+    if (( conf_exists )); then
+        raw=$(sed -n 's/^PACING_RATE_BPS=\([0-9]*\)$/\1/p' "$PACING_CONFIG_FILE")
+        pacing_valid_rate "$raw" || return 1
+        expected=$((10#$raw * 8 / 1000)); (( expected >= 1 )) || expected=1
+        expected=$((expected * 1000 / 8))
+    fi
+    for path in /sys/class/net/*; do
+        iface=${path##*/}; [[ "$iface" == lo ]] && continue
+        root=$(pacing_read_root "$iface") || return 1
+        [[ $(jq -r .kind <<< "$root") == fq ]] || continue
+        rate=$(pacing_root_rate "$root") || return 1
+        if [[ -n "$expected" && "$rate" == "$expected" ]]; then
+            pacing_require_fq "$root" || return 1
+            [[ $(jq -r .handle <<< "$root") =~ ^[0-9a-fA-F]+:$ &&
+               $(jq -r .handle <<< "$root") != '0:' ]] || return 1
+            boot=$(pacing_boot_id) && [[ -n "$boot" ]] || return 1
+            ifindex=$(pacing_ifindex "$iface") && [[ "$ifindex" =~ ^[0-9]+$ ]] || return 1
+            planned+=("$iface")
+            snapshots+=("$(jq -cn --arg iface "$iface" --arg boot "$boot" --arg ifindex "$ifindex" \
+                --arg handle "$(jq -r .handle <<< "$root")" \
+                '{iface:$iface,boot:$boot,ifindex:$ifindex,handle:$handle}')")
+        elif (( conf_exists )) && [[ "$rate" != 4294967295 ]]; then
+            echo "$iface 上限与旧记录不符，保留该上限，请人工核对。"
+            mismatch=1
+        fi
     done
-
-    [ -f "$PACING_LIB_PATH" ] && rm -f "$PACING_LIB_PATH"
-    [ -f "$PACING_SRC_PATH" ] && rm -f "$PACING_SRC_PATH"
-    pacing_remove_sysctl
-    [ -f "$PACING_CONFIG_FILE" ] && rm -f "$PACING_CONFIG_FILE"
-
-    # 尝试恢复 pfifo_fast
-    local iface
-    for iface in $(ls /sys/class/net 2>/dev/null); do
-        [ "$iface" = "lo" ] && continue
-        tc qdisc replace dev "$iface" root pfifo_fast 2>/dev/null
+    if (( mismatch )); then
+        pacing_error "发现与旧记录不符的现有限速；未删除旧版配置或 sysctl 文件，避免留下无法识别的限速。"
+        return 1
+    fi
+    stamp=$(date +%Y%m%d-%H%M%S)-$$
+    backup="${PACING_CONFIG_FILE}.legacy-${stamp}"
+    # 先复制证据，再清理；归档不以 .conf 结尾，防止启动时再次加载。
+    if (( conf_exists )); then cp -p -- "$PACING_CONFIG_FILE" "$backup" || return 1; fi
+    if [[ -f "$PACING_SYSCTL_FILE" ]]; then
+        cp -p -- "$PACING_SYSCTL_FILE" "${PACING_SYSCTL_FILE}.disabled-${stamp}" || return 1
+    fi
+    # 先完成全部接口读取/校验，再开始修改，避免中途读取失败留下半配置。
+    for ((i=0; i<${#planned[@]}; i++)); do
+        iface=${planned[i]}
+        if ! pacing_set_rate "$iface" 4294967295 "${snapshots[i]}" "$expected"; then
+            # 本接口可能修改成功但读回失败，因此也纳入回滚。
+            for ((; i>=0; i--)); do
+                iface=${planned[i]}
+                pacing_set_rate "$iface" "$expected" "${snapshots[i]}" "$expected 4294967295" || \
+                    pacing_error "$iface 回滚失败，请核对实际队列。"
+            done
+            return 1
+        fi
     done
+    [[ ! -f "$PACING_SYSCTL_FILE" ]] || rm -- "$PACING_SYSCTL_FILE" || return 1
+    (( ! conf_exists )) || rm -- "$PACING_CONFIG_FILE" || return 1
+    echo "旧版配置已归档；已清除 ${#planned[@]} 张接口的匹配上限。"
+    echo "请查看 [3] 中的 TCP 参数。旧缓冲区运行值需按基线恢复或重启后核对。"
+    echo "如曾安装旧 LD_PRELOAD 库，请另行检查服务 drop-in；本操作不会重启代理。"
+}
 
-    echo ""
-    echo -e "${gl_lv}✅ 已完全卸载${gl_bai}"
-    break_end
+pacing_forget_stale() {
+    local state boot
+    state=$(pacing_read_state) || return 1
+    boot=$(pacing_boot_id) && [[ -n "$boot" ]] || {
+        pacing_error "无法读取当前启动标识，保留恢复记录。"; return 1;
+    }
+    [[ "$boot" != "$(jq -r .boot <<< "$state")" ]] || {
+        pacing_error "同一次启动的记录请使用 [4] 恢复，不能直接删除。"; return 1;
+    }
+    rm -- "$PACING_CONFIG_FILE" || return 1
+    echo "已删除上次启动的记录，未修改当前网络。"
 }
 
 manage_tcp_pacing_limit() {
+    local choice
+    pacing_dependencies || { break_end; return 1; }
     while true; do
         clear
-        pacing_load_config
-        echo -e "${gl_zi}╔════════════════════════════════════════════════╗${gl_bai}"
-        echo -e "${gl_zi}║       TCP 单连接限速管理  (FQ maxrate)        ║${gl_bai}"
-        echo -e "${gl_zi}╚════════════════════════════════════════════════╝${gl_bai}"
-        echo ""
+        echo "FQ 每流限速管理"
         pacing_status_summary
-        echo -e "${gl_kjlan}━━━━━━━━━━ 操作选项 ━━━━━━━━━━${gl_bai}"
-        echo "  1. 一键启用（FQ + BBR + 每flow限速）⭐"
-        echo "  2. 修改每连接限速值"
-        echo "  3. 查看实时连接 pacing 状态（验证是否生效）"
-        echo "  4. 关闭限速（保留 FQ + BBR + 游戏优化）"
-        echo "  5. 完全卸载（恢复默认）"
-        echo ""
-        echo "  0. 返回主菜单"
-        echo -e "${gl_kjlan}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
-        read -e -p "请输入选项 [0-5]: " p_choice
-
-        case "$p_choice" in
-            1) pacing_enable_all ;;
-            2) pacing_modify_rate ;;
-            3) pacing_view_realtime ;;
-            4) pacing_disable_keep_fq ;;
-            5) pacing_full_uninstall ;;
-            0) return ;;
-            *) echo -e "${gl_hong}无效选项${gl_bai}"; sleep 1 ;;
+        echo "1. 选择网卡并限速（保留现有 TCP 参数）"
+        echo "2. 修改速率（0 = 关闭）"
+        echo "3. 查看实际队列与 TCP 状态"
+        echo "4. 关闭并恢复本版本修改前的上限"
+        echo "5. 清理旧版限速及全局调优配置"
+        echo "6. 删除上次启动的过期记录"
+        echo "0. 返回"
+        read -r -p "请选择: " choice || return
+        case "$choice" in
+            1) pacing_enable_all;; 2) pacing_modify_rate;; 3) pacing_view_realtime;;
+            4) pacing_locked pacing_disable;; 5) pacing_locked pacing_legacy_cleanup;;
+            6) pacing_locked pacing_forget_stale;; 0) return;; *) echo "无效选项";;
         esac
+        break_end
     done
 }
+
 
 #启用BBR+cake
 startbbrcake() {
