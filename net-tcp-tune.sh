@@ -11527,7 +11527,7 @@ pacing_read_policy() {
     [[ -f "$PACING_POLICY_FILE" ]] || return 1
     jq -ce 'select(.version == 1 and (.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and
         .iface != "lo" and (.rate | type == "number" and . > 0 and
-        .rate < 4294967295 and .rate == floor))' "$PACING_POLICY_FILE" 2>/dev/null
+        . < 4294967295 and . == floor))' "$PACING_POLICY_FILE" 2>/dev/null
 }
 
 pacing_enable_autostart() {
