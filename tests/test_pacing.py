@@ -1,0 +1,341 @@
+"""Isolated shell control-flow tests. No real sysctl/tc/network changes.
+
+Run: python -m unittest discover -s tests -v
+Windows: set BASH_EXE and add jq.exe to PATH (Git Bash supported).
+"""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+REPO = Path(__file__).resolve().parents[1]
+BASH = os.environ.get('BASH_EXE') or shutil.which('bash') or r'C:\Program Files\Git\bin\bash.exe'
+
+
+def shell_path(path):
+    path = Path(path).resolve()
+    return '/' + path.drive[0].lower() + path.as_posix()[2:] if os.name == 'nt' else str(path)
+
+
+class PacingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='pacing-test-')
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        # Git Bash on Windows can inherit a restrictive ACL from Python's
+        # 0700 temporary directory and then cannot create nested fixtures.
+        if os.name == 'nt':
+            os.chmod(self.base, 0o777)
+        self.config = self.base / 'config'
+        self.net = self.base / 'net'
+        for iface in ('eth0', 'tun0', 'lo'):
+            (self.net / iface).mkdir(parents=True)
+        self.state = self.base / 'kernel.json'
+        self.events = self.base / 'events'
+        self.write_kernel()
+        text = (REPO / 'net-tcp-tune.sh').read_text(encoding='utf-8')
+        section = text[text.index('# TCP/FQ 每流限速：'):text.index('#启用BBR+cake')]
+        section = section.replace('/sys/class/net', shell_path(self.net))
+        (self.base / 'module.sh').write_text(section, encoding='utf-8', newline='\n')
+
+    def write_kernel(self, kind='fq', rate=None, pacing=True):
+        options = {'limit': 1234, 'flow_limit': 45, 'pacing': pacing}
+        if rate is not None:
+            options['maxrate'] = rate
+        self.state.write_text(json.dumps({i: {'kind': kind, 'root': True,
+            'handle': '8001:', 'options': dict(options)} for i in ('eth0', 'tun0')}))
+
+    def run_shell(self, body, setup=''):
+        # jq does actual JSON work. Only network and platform identity are stubbed.
+        prefix = f"""
+set -e
+source '{shell_path(self.base / 'module.sh')}'
+PACING_CONFIG_FILE='{shell_path(self.config)}'
+PACING_SYSCTL_FILE='{shell_path(self.base / 'old.conf')}'
+PACING_LOCK_FILE='{shell_path(self.base / 'lock')}'
+KERNEL='{shell_path(self.state)}'
+EVENTS='{shell_path(self.events)}'
+pacing_boot_id() {{ echo boot-1; }}
+pacing_ifindex() {{ echo 2; }}
+break_end() {{ :; }}
+sysctl() {{ echo 'FORBIDDEN sysctl' >> "$EVENTS"; return 99; }}
+systemctl() {{ echo 'FORBIDDEN systemctl' >> "$EVENTS"; return 99; }}
+tc() {{
+    printf '%s\\n' "$*" >> "$EVENTS"
+    if [[ "$1" == -j ]]; then
+        [[ "$READ_FAIL" != 1 ]] || return 2
+        jq -c --arg dev "$5" '[.[$dev]]' "$KERNEL"
+    elif [[ "$1 $2" == 'qdisc change' ]]; then
+        [[ "$FAIL_BEFORE" != 1 ]] || return 2
+        local token=${{!#}} dev=$4 rate
+        rate=${{token%bit}}
+        if [[ "$6" == handle ]]; then
+            [[ $(jq -r --arg dev "$dev" '.[$dev].handle' "$KERNEL") == "$7" ]] || return 2
+        fi
+        jq --arg dev "$dev" --argjson rate "$((rate / 8))" \\
+           '.[$dev].options.maxrate=$rate' "$KERNEL" > "$KERNEL.tmp" || return 2
+        mv "$KERNEL.tmp" "$KERNEL"
+        [[ "$FAIL_AFTER" != 1 ]] || return 2
+    else
+        echo 'FORBIDDEN tc command' >> "$EVENTS"; return 99
+    fi
+}}
+"""
+        if os.name == 'nt':
+            prefix = 'jq() { command jq.exe -b "$@"; }\n' + prefix
+        proc = subprocess.run([BASH, '--noprofile', '--norc', '-s'],
+                              input=prefix + setup + '\n' + body + '\n',
+                              capture_output=True, text=True, encoding='utf-8', timeout=20)
+        if self.events.exists():
+            self.assertNotIn('FORBIDDEN', self.events.read_text())
+        return proc
+
+    def ok(self, body, setup=''):
+        proc = self.run_shell(body, setup)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc
+
+    def rate(self, iface='eth0'):
+        return json.loads(self.state.read_text())[iface]['options'].get('maxrate', 4294967295)
+
+    def test_decimal_leading_zero_and_units(self):
+        result = self.ok('pacing_parse_rate 08M; pacing_parse_rate 010; pacing_parse_rate 0000; pacing_parse_rate 3G')
+        self.assertEqual(result.stdout.splitlines(), ['8388608', '10240', '0', '3221225472'])
+
+    def test_reject_invalid_overflow_and_sentinel(self):
+        self.ok('for r in 4G 9223372036854775807G -1 1.5M abc; do pacing_parse_rate "$r" && exit 1; done; exit 0')
+
+    def test_empty_input_cancels(self):
+        self.ok("pacing_input_rate <<< '' && exit 1; exit 0")
+        self.assertFalse(self.config.exists())
+
+    def test_apply_modify_disable_preserves_queue_and_other_iface(self):
+        self.ok('pacing_apply_rate eth0 10485760; pacing_apply_rate eth0 20971520; pacing_disable')
+        self.assertEqual(self.rate(), 4294967295)
+        self.assertEqual(self.rate('tun0'), 4294967295)
+        self.assertEqual(json.loads(self.state.read_text())['eth0']['options']['limit'], 1234)
+        self.assertFalse(self.config.exists())
+
+    def test_zero_uses_disable_no_1kbit(self):
+        self.ok("pacing_apply_rate eth0 10485760; pacing_enable_all <<< 0", 'pacing_locked() { "$@"; }')
+        self.assertEqual(self.rate(), 4294967295)
+        self.assertNotIn('1kbit', self.events.read_text())
+
+    def test_non_fq_and_nopacing_rejected(self):
+        for kind, pacing in [('cake', True), ('mq', True), ('fq_codel', True), ('fq', False)]:
+            with self.subTest(kind=kind, pacing=pacing):
+                self.write_kernel(kind=kind, pacing=pacing)
+                self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760').returncode, 0)
+                self.assertFalse(self.config.exists())
+
+    def test_default_handle_zero_rejected_without_replacement(self):
+        self.write_kernel()
+        data = json.loads(self.state.read_text())
+        data['eth0']['handle'] = '0:'
+        self.state.write_text(json.dumps(data))
+        proc = self.run_shell('pacing_apply_rate eth0 10485760')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(self.config.exists())
+        self.assertNotIn('qdisc change', self.events.read_text())
+
+    def test_foreign_cap_rejected(self):
+        self.write_kernel(rate=123456)
+        self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760').returncode, 0)
+        self.assertEqual(self.rate(), 123456)
+
+    def test_tc_failure_and_failed_rollback_keeps_pending_record(self):
+        proc = self.run_shell('FAIL_BEFORE=1; pacing_apply_rate eth0 10485760')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(self.config.read_text())['phase'], 'pending')
+        self.ok('pacing_disable')
+        self.assertFalse(self.config.exists())
+
+    def test_initial_save_failure_makes_no_network_change(self):
+        self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760',
+                            'pacing_write_state() { return 1; }').returncode, 0)
+        self.assertNotIn('qdisc change', self.events.read_text())
+
+    def test_final_save_failure_rolls_back(self):
+        setup = '''eval "$(declare -f pacing_write_state | sed '1s/pacing_write_state/original_write/')"
+saves=0
+pacing_write_state() { saves=$((saves+1)); [[ $saves != 2 ]] || return 1; original_write "$@"; }
+'''
+        self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760', setup).returncode, 0)
+        self.assertEqual(self.rate(), 4294967295)
+        self.assertFalse(self.config.exists())
+
+    def test_disable_failure_does_not_claim_disabled(self):
+        self.ok('pacing_apply_rate eth0 10485760')
+        proc = self.run_shell('FAIL_BEFORE=1; pacing_disable')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(self.config.exists())
+        self.assertEqual(self.rate(), 10485760)
+
+    def test_external_change_refused(self):
+        self.ok('pacing_apply_rate eth0 10485760')
+        self.write_kernel(rate=100000)
+        self.assertNotEqual(self.run_shell('pacing_disable').returncode, 0)
+        self.assertEqual(self.rate(), 100000)
+
+    def test_reboot_stale_record_not_applied(self):
+        self.ok('pacing_apply_rate eth0 10485760')
+        self.write_kernel()
+        self.assertNotEqual(self.run_shell('pacing_disable', 'pacing_boot_id() { echo boot-2; }').returncode, 0)
+        self.ok('pacing_forget_stale', 'pacing_boot_id() { echo boot-2; }')
+        self.assertFalse(self.config.exists())
+
+    def test_legacy_not_executed_and_blocks_enable(self):
+        self.config.write_text('echo CONFIG_EXECUTED\n')
+        proc = self.run_shell('pacing_apply_rate eth0 10485760')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn('CONFIG_EXECUTED', proc.stdout)
+
+    def test_old_sysctl_blocks_new_enable(self):
+        (self.base / 'old.conf').write_text('old settings')
+        self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760').returncode, 0)
+        self.assertEqual(self.rate(), 4294967295)
+
+    def test_legacy_zero_cleanup_archives_and_clears_matching_caps(self):
+        self.config.write_text('# TCP 单连接限速配置 (由 net-tcp-tune.sh 自动管理)\nPACING_RATE_BPS=0\n', encoding='utf-8')
+        (self.base / 'old.conf').write_text('# === 由 net-tcp-tune.sh 写入：FQ + BBR + 游戏延迟优化 ===\n', encoding='utf-8')
+        self.write_kernel(rate=125)
+        self.ok('pacing_legacy_cleanup <<< y')
+        self.assertEqual(self.rate(), 4294967295)
+        self.assertEqual(self.rate('tun0'), 4294967295)
+        self.assertFalse(self.config.exists())
+        self.assertFalse((self.base / 'old.conf').exists())
+        self.assertEqual(len(list(self.base.glob('old.conf.disabled-*'))), 1)
+
+    def test_status_checks_kernel_instead_of_saved_switch(self):
+        self.ok('pacing_apply_rate eth0 10485760')
+        self.write_kernel(rate=125)
+        proc = self.ok('pacing_status_summary')
+        self.assertIn('不一致', proc.stdout)
+
+    def legacy_fixture(self):
+        self.config.write_text('# TCP 单连接限速配置 (由 net-tcp-tune.sh 自动管理)\nPACING_RATE_BPS=0\n', encoding='utf-8')
+        self.write_kernel(rate=125)
+
+    def test_legacy_preflight_failure_changes_no_interface(self):
+        self.legacy_fixture()
+        setup = '''eval "$(declare -f tc | sed '1s/tc/original_tc/')"
+tc() { [[ "$*" != '-j qdisc show dev tun0' ]] || return 2; original_tc "$@"; }
+'''
+        self.assertNotEqual(self.run_shell('pacing_legacy_cleanup <<< y', setup).returncode, 0)
+        self.assertEqual(self.rate(), 125)
+        self.assertTrue(self.config.exists())
+        self.assertNotIn('qdisc change', self.events.read_text())
+
+    def test_legacy_second_interface_failure_rolls_back_first(self):
+        self.legacy_fixture()
+        setup = '''eval "$(declare -f tc | sed '1s/tc/original_tc/')"
+tc() {
+    [[ "$1 $2 $4" != 'qdisc change tun0' || "${!#}" != 34359738360bit ]] || return 2
+    original_tc "$@"
+}
+'''
+        self.assertNotEqual(self.run_shell('pacing_legacy_cleanup <<< y', setup).returncode, 0)
+        self.assertEqual(self.rate(), 125)
+        self.assertEqual(self.rate('tun0'), 125)
+        self.assertTrue(self.config.exists())
+
+    def test_device_recreation_refuses_to_touch_new_device(self):
+        self.ok('pacing_apply_rate eth0 10485760')
+        self.write_kernel()
+        self.assertNotEqual(self.run_shell('pacing_disable', 'pacing_ifindex() { echo 999; }').returncode, 0)
+        self.assertEqual(self.rate(), 4294967295)
+
+    def test_pending_record_can_recover_after_interruption(self):
+        setup = '''eval "$(declare -f tc | sed '1s/tc/original_tc/')"
+tc() {
+    original_tc "$@"
+    if [[ "$1 $2" == 'qdisc change' ]]; then exit 130; fi
+}
+'''
+        self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760', setup).returncode, 0)
+        self.assertEqual(self.rate(), 10485760)
+        self.assertEqual(json.loads(self.config.read_text())['phase'], 'pending')
+        self.ok('pacing_disable')
+        self.assertEqual(self.rate(), 4294967295)
+
+    def test_pending_record_refuses_external_rate_before_disable(self):
+        setup = '''eval "$(declare -f tc | sed '1s/tc/original_tc/')"
+tc() {
+    original_tc "$@"
+    if [[ "$1 $2" == 'qdisc change' ]]; then exit 130; fi
+}
+'''
+        self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760', setup).returncode, 0)
+        self.write_kernel(rate=100000)
+        proc = self.run_shell('pacing_disable')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.rate(), 100000)
+        self.assertTrue(self.config.exists())
+
+    def test_identity_checked_after_change(self):
+        setup = '''eval "$(declare -f tc | sed '1s/tc/original_tc/')"
+pacing_ifindex() { if [[ -f "$KERNEL.ifindex" ]]; then cat "$KERNEL.ifindex"; else echo 2; fi; }
+tc() {
+    original_tc "$@" || return $?
+    if [[ "$1 $2" == 'qdisc change' ]]; then printf '999\\n' > "$KERNEL.ifindex"; fi
+}
+'''
+        proc = self.run_shell('pacing_apply_rate eth0 10485760', setup)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(self.config.exists())
+
+    def test_interrupted_modify_before_tc_can_disable(self):
+        self.ok('pacing_apply_rate eth0 10485760')
+        setup = '''eval "$(declare -f pacing_write_state | sed '1s/pacing_write_state/original_write/')"
+pacing_write_state() { original_write "$@"; exit 130; }
+'''
+        self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 20971520', setup).returncode, 0)
+        self.assertEqual(self.rate(), 10485760)
+        self.assertEqual(json.loads(self.config.read_text())['previous_rate'], 10485760)
+        self.ok('pacing_disable')
+        self.assertEqual(self.rate(), 4294967295)
+        self.assertFalse(self.config.exists())
+
+    def test_unreadable_or_empty_boot_id_preserves_record(self):
+        self.ok('pacing_apply_rate eth0 10485760')
+        for code in ('return 1', 'return 0'):
+            with self.subTest(code=code):
+                proc = self.run_shell('pacing_forget_stale', 'pacing_boot_id() { ' + code + '; }')
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertTrue(self.config.exists())
+                self.assertEqual(self.rate(), 10485760)
+
+    def test_legacy_rebuilt_queue_is_not_overwritten(self):
+        self.legacy_fixture()
+        setup = '''eval "$(declare -f tc | sed '1s/tc/original_tc/')"
+tc() {
+    if [[ "$1 $2 $4" == 'qdisc change eth0' && ! -f "$KERNEL.rebuilt" ]]; then
+        jq '.eth0.handle="9001:" | .eth0.options.maxrate=500000' "$KERNEL" > "$KERNEL.tmp"
+        mv "$KERNEL.tmp" "$KERNEL"
+        touch "$KERNEL.rebuilt"
+    fi
+    original_tc "$@"
+}
+'''
+        proc = self.run_shell('pacing_legacy_cleanup <<< y', setup)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.rate(), 500000)
+        self.assertTrue(self.config.exists())
+
+    def test_legacy_mismatched_cap_preserves_files(self):
+        self.legacy_fixture()
+        self.write_kernel(rate=10485750)
+        old_sysctl = self.base / 'old.conf'
+        old_sysctl.write_text('# === 由 net-tcp-tune.sh 写入：FQ + BBR + 游戏延迟优化 ===\n', encoding='utf-8')
+        proc = self.run_shell('pacing_legacy_cleanup <<< y')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(self.config.exists())
+        self.assertTrue(old_sysctl.exists())
+        self.assertEqual(self.rate(), 10485750)
+
+
+if __name__ == '__main__':
+    unittest.main()
