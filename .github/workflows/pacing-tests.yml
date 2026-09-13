@@ -3,14 +3,16 @@ name: Option 39 pacing checks
 on:
   pull_request:
     paths:
-      - net-tcp-tune.sh
+      - '**/*.sh'
       - tests/**
+      - .gitattributes
       - .github/workflows/pacing-tests.yml
   push:
     branches: [main, fix/option39-pacing-recovery]
     paths:
-      - net-tcp-tune.sh
+      - '**/*.sh'
       - tests/**
+      - .gitattributes
       - .github/workflows/pacing-tests.yml
   workflow_dispatch:
 
@@ -27,8 +29,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y iproute2 jq util-linux
       - name: Check Bash syntax
         run: |
-          bash -n net-tcp-tune.sh
-          bash -n tests/pacing-netns.sh
+          find . -type f -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
+      - name: Reject CRLF in shell scripts
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          bad = [
+              str(path)
+              for path in Path('.').rglob('*.sh')
+              if '.git' not in path.parts and b'\r' in path.read_bytes()
+          ]
+          if bad:
+              raise SystemExit('Shell scripts contain CR bytes: ' + ', '.join(bad))
+          PY
       - name: Run isolated control-flow tests
         run: python3 -B -m unittest discover -s tests -v
       - name: Verify real FQ in an isolated network namespace
