@@ -209,6 +209,29 @@ chmod +x net-tcp-tune.sh
 
 ## ⚠️ 常见问题
 
+### 功能 39：默认 mq + FQ 报 Failed to find specified qdisc
+
+如果 `tc -j -d qdisc show dev eth0` 显示根 `mq` 的 handle 为 `0:`，
+FQ 叶子的 parent 为 `:1`、`:2`，先进入 **39 → 7**，输入网卡并确认迁移，
+再选择 **1** 设置上限。这不需要重新安装 BBR，也不会修改 TCP 缓冲区。
+
+迁移会备份原 FQ 参数到 `/etc/net-tcp-tune-pacing.conf.migration-*`，
+将根和叶子改为可定址的非零 handle，并读回核对参数。不支持的参数或已有上限会拒绝迁移。
+重建队列可能短暂丢包、影响现有连接；请安排维护窗口，不能保证完全不影响延迟。
+若迁移报错，不要继续限速，用选项 3 检查实际队列，并保留备份供恢复参数使用。
+备份不是自动回滚工具，不能恢复已丢弃的数据包或内核默认的零 handle。
+关闭限速仅恢复每流上限，保留非零 handle 的 mq + FQ。
+确认迁移后，开机恢复允许对同一网卡的同类默认队列再次迁移。
+
+纯数字 `20` 表示 **20 KiB/s**；`20M` 表示 **20 MiB/s**，不是 20 Mbit/s。
+该功能作用于网卡的出站 FQ 流（包括 UDP），不是整张网卡总带宽上限。
+
+需要开机恢复时，请下载为普通文件运行，不要使用 `bash <(curl ...)`：
+
+```bash
+script=$(mktemp /tmp/net-tcp-tune.XXXXXX.sh) && curl -fsSL "https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh?$(date +%s)" -o "$script" && bash "$script"
+```
+
 **Q: 安装后运行 `bbr` 提示找不到命令？**
 A: 请执行 `source ~/.bashrc` 重新加载配置，或者断开 SSH 重连即可。
 

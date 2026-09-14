@@ -157,6 +157,18 @@ tc() {{
         self.assertEqual(result.stdout.splitlines(), ['limit', '10000', 'timer_slack', '10000ns',
             'horizon', '10000000us', 'low_rate_threshold', '550000bit', 'horizon_drop'])
 
+    def test_zero_mq_requires_migration_before_writing_state(self):
+        self.write_kernel_mq()
+        data = json.loads(self.state.read_text())
+        data['eth0'][0]['handle'] = '0:'
+        for item in data['eth0'][1:]:
+            item['parent'] = item['parent'][1:]
+        self.state.write_text(json.dumps(data))
+        proc = self.run_shell('pacing_apply_rate eth0 20480', self.mq_setup())
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(self.config.exists())
+        self.assertNotIn('qdisc change', self.events.read_text())
+
     def test_migration_rejects_unknown_or_invalid_options(self):
         for options in ('{"new_option":1}', '{"limit":"oops"}', '{"pacing":null}'):
             with self.subTest(options=options):
@@ -252,12 +264,11 @@ tc() {{
         self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760').returncode, 0)
         self.assertEqual(self.rate(), 123456)
 
-    def test_tc_failure_and_failed_rollback_keeps_pending_record(self):
+    def test_tc_failure_before_change_needs_no_rollback(self):
         proc = self.run_shell('FAIL_BEFORE=1; pacing_apply_rate eth0 10485760')
         self.assertNotEqual(proc.returncode, 0)
-        self.assertEqual(json.loads(self.config.read_text())['phase'], 'pending')
-        self.ok('pacing_disable')
         self.assertFalse(self.config.exists())
+        self.assertEqual(self.rate(), 4294967295)
 
     def test_initial_save_failure_makes_no_network_change(self):
         self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760',

@@ -46,6 +46,7 @@ jobs:
       - name: Run isolated control-flow tests
         run: python3 -B -m unittest discover -s tests -v
       - name: Verify real FQ in an isolated network namespace
+        if: ${{ !cancelled() }}
         run: |
           old=$(sysctl -n net.core.default_qdisc)
           trap 'sudo sysctl -w net.core.default_qdisc="$old"' EXIT
