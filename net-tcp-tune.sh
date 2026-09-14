@@ -11501,14 +11501,23 @@ pacing_input_rate() {
 
 pacing_pick_iface() {
     local line name state choice
-    local -a ifaces=() states=()
+    local -a ifaces=() states=() up_ifaces=() up_states=()
     while IFS= read -r line; do
         read -r name state _ <<< "$line"
         name=${name%%@*}
         [[ -n "$name" && "$name" != lo && "$name" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]] || continue
+        [[ "$name" =~ ^(sit|ip6tnl|ip6gre|gre|erspan|teql|dummy)[0-9]*$ ]] && continue
         ifaces+=("$name")
         states+=("${state:-UNKNOWN}")
+        if [[ "${state^^}" == UP ]]; then
+            up_ifaces+=("$name")
+            up_states+=("$state")
+        fi
     done < <(ip -br link) || return 1
+    if ((${#up_ifaces[@]} > 0)); then
+        ifaces=("${up_ifaces[@]}")
+        states=("${up_states[@]}")
+    fi
     ((${#ifaces[@]} > 0)) || { pacing_error "没有可选择的网卡。"; return 1; }
     echo "请选择网卡："
     local i
@@ -11562,11 +11571,20 @@ pacing_read_layout() {
         mq)
             handle=$(jq -r '.handle // "0:"' <<< "$root")
             [[ "$handle" =~ ^[0-9a-fA-F]+:$ ]] || return 1
-            if [[ "$handle" == "0:" ]]; then prefix=":"; else prefix="$handle"; fi
-            children=$(jq -ce --arg prefix "$prefix" '[.[] |
-                select((.parent? | type) == "string") |
-                select(.parent | startswith($prefix)) |
-                select((.parent | ltrimstr($prefix)) | test("^[0-9a-fA-F]+$"))]' <<< "$data") || return 1
+            if [[ "$handle" == "0:" ]]; then
+                children=$(jq -ce '[.[] | select((.parent|type) == "string") |
+                    .parent as $p |
+                    (if ($p|test("^:[0-9a-fA-F]+$")) then $p
+                     elif ($p|test("^0:[0-9a-fA-F]+$")) then (":" + ($p|ltrimstr("0:")))
+                     else empty end) as $np | select($np != null) |
+                    . + {parent:$np}]' <<< "$data") || return 1
+            else
+                prefix="$handle"
+                children=$(jq -ce --arg prefix "$prefix" '[.[] |
+                    select((.parent? | type) == "string") |
+                    select(.parent | startswith($prefix)) |
+                    select((.parent | ltrimstr($prefix)) | test("^[0-9a-fA-F]+$"))]' <<< "$data") || return 1
+            fi
             [[ $(jq -r length <<< "$children") -gt 0 ]] || {
                 pacing_error "$iface 的 mq 根队列下没有发现发送叶子队列。"; return 1;
             }
@@ -11634,13 +11652,13 @@ pacing_fq_args() {
 # iproute2 may also emit metadata keys such as dev or offloaded.
 pacing_is_default_zero_mq() {
     jq -e '
+      def mq_leaf:
+        (.parent|type) == "string" and
+        ((.parent|test("^:[0-9a-fA-F]+$")) or (.parent|test("^0:[0-9a-fA-F]+$")));
       ([.[]|select(.root == true)]|length == 1) and
-      ([.[]|select(.root == true and .kind == "mq" and .handle == "0:" and
-        (((.options // {})|keys) - ["offloaded"]|length) == 0)]|length == 1) and
-      ([.[]|select(.parent != null)]|length) > 0 and
-      all(.[]|select(.parent != null); .kind == "fq" and .handle == "0:" and
-        (.parent|test("^:[0-9a-fA-F]+$")) and
-        (.options.maxrate // 4294967295) == 4294967295)' <<< "$1" >/dev/null
+      any(.[]; .root == true and .kind == "mq" and .handle == "0:") and
+      ([.[]|select(mq_leaf)]|length) > 0 and
+      all(.[]|select(mq_leaf); .kind == "fq" and ((.handle // "0:") == "0:"))' <<< "$1" >/dev/null
 }
 
 pacing_mq_root_handle() {
@@ -11650,11 +11668,13 @@ pacing_mq_root_handle() {
 
 pacing_is_partial_migrate() {
     jq -e '
-      ([.[]|select(.root == true and .kind == "mq" and .handle != "0:" and
-        (.handle|test("^[0-9a-fA-F]+:$")))]|length == 1) and
-      ([.[]|select(.parent != null)]|length > 0) and
-      all(.[]|select(.parent != null); .kind == "fq" and .handle == "0:" and
-        (.parent|test("^[0-9a-fA-F]+:[0-9a-fA-F]+$")))' <<< "$1" >/dev/null
+      . as $all |
+      ([$all[]|select(.root == true and .kind == "mq")|.handle] |
+        if length == 1 then .[0] else empty end) as $h |
+      ($h != null and $h != "0:" and ($h|test("^[0-9a-fA-F]+:$"))) and
+      ([$all[]|select((.parent|type)=="string" and (.parent|startswith($h)))] | length > 0) and
+      all($all[]|select((.parent|type)=="string" and (.parent|startswith($h)));
+        .kind == "fq" and .handle == "0:")' <<< "$1" >/dev/null
 }
 
 pacing_pick_mq_root_handle() {
@@ -11762,6 +11782,18 @@ pacing_migrate_mq_leaves() {
 
 # Explicitly authorized migration. Backups are evidence, not a promise to restore
 # the kernel-created zero handles or packets discarded by root replacement.
+pacing_explain_qdisc() {
+    local iface="$1" data="$2"
+    echo "$iface 当前队列摘要："
+    jq -r '
+      (.[]|select(.root == true) |
+        "  根: \(.kind) handle \(.handle // "0:")"),
+      (.[]|select((.parent|type)=="string") |
+        "  叶子: \(.kind) parent \(.parent) handle \(.handle // "0:") maxrate \(.options.maxrate // 4294967295)")
+    ' <<< "$data" 2>/dev/null || true
+    echo "根已是 FQ，或 mq 已经可定址时，请直接选择 [1] 限速，不必选 [7]。"
+}
+
 pacing_migrate_zero_mq() {
     local iface="$1" data layout state options encoded parent minor handle backup after leaf left right filters failed=0 root_hex
     local -a parents=() commands=() args=()
@@ -11771,10 +11803,16 @@ pacing_migrate_zero_mq() {
         pacing_migrate_mq_leaves "$iface" "$data"
         return $?
     fi
+    if ! pacing_is_default_zero_mq "$data"; then
+        if layout=$(pacing_read_layout "$iface" 2>/dev/null) && pacing_layout_addressable "$layout"; then
+            echo "当前已是可定址的 $(jq -r .topology <<< "$layout")，无需迁移。请直接选择 [1] 限速。"
+            return 0
+        fi
+        pacing_error "不是需要迁移的默认零 handle mq；未修改队列。"
+        pacing_explain_qdisc "$iface" "$data"
+        return 1
+    fi
     layout=$(pacing_read_layout "$iface") || return 1
-    pacing_is_default_zero_mq "$data" || {
-        pacing_error "仅迁移全部叶子为无限速 FQ 的默认零 handle mq；未修改队列。"; return 1;
-    }
     filters=$(tc -j filter show dev "$iface" root 2>/dev/null || echo '[]')
     [[ "$filters" == '[]' || -z "$filters" ]] || {
         pacing_error "存在过滤器或无法检查过滤器，拒绝迁移。"; return 1;
@@ -11789,7 +11827,8 @@ pacing_migrate_zero_mq() {
     for parent in "${parents[@]}"; do
         minor=${parent#:}
         handle=$(pacing_leaf_handle "$minor" "$root_hex") || return 1
-        options=$(jq -ce --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
+        options=$(jq -ce --arg parent "$parent" --arg alt "0:${parent#:}" \
+            '.[]|select(.parent == $parent or .parent == $alt)|.options' <<< "$data") || return 1
         PACING_FQ_SKIP_WEIGHTS=1
         encoded=$(pacing_fq_args "$options") || { pacing_error "FQ 参数不能安全重建，未修改队列。"; return 1; }
         commands+=("$encoded")
@@ -11817,7 +11856,8 @@ pacing_migrate_zero_mq() {
       any(.[]; .root == true and .kind == "mq" and .handle == $handle) and
       ([.[]|select(.parent != null)]|length == $count)' <<< "$after" >/dev/null || failed=1
     for parent in "${parents[@]}"; do
-        options=$(jq -c --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
+        options=$(jq -c --arg parent "$parent" --arg alt "0:${parent#:}" \
+            '.[]|select(.parent == $parent or .parent == $alt)|.options' <<< "$data") || return 1
         minor=${parent#:}
         handle=$(pacing_leaf_handle "$minor" "$root_hex") || { failed=1; continue; }
         leaf=$(jq -ce --arg parent "${root_hex}:$minor" --arg handle "$handle" \
@@ -11838,6 +11878,7 @@ pacing_migrate_zero_mq() {
 pacing_migrate_menu() {
     local answer
     pacing_pick_iface || return 1
+    echo "只在默认零 handle 的 mq + FQ 上需要迁移。根已是 FQ，或 mq 已可定址时请直接选 [1]。"
     echo "将重建默认 mq + FQ 并备份参数；可能短暂丢包/中断，不能保证延迟不受影响。"
     echo "成功后允许开机恢复时对该网卡同类默认队列再次迁移；不会设置 BBR 或 TCP 缓冲区。"
     read -r -p "确认迁移？[y/N]: " answer || return 1

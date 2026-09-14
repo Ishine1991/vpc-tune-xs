@@ -224,8 +224,10 @@ tc() {{
         self.ok("pacing_is_default_zero_mq '" + sample + "'")
         extra = json.loads(sample)
         extra[1]['options']['maxrate'] = 12345
-        self.assertNotEqual(
-            self.run_shell("pacing_is_default_zero_mq '" + json.dumps(extra) + "'").returncode, 0)
+        extra[0]['options'] = {'offloaded': False, 'hw': True}
+        extra[1]['parent'] = '0:2'
+        extra[2]['parent'] = '0:1'
+        self.ok("pacing_is_default_zero_mq '" + json.dumps(extra) + "'")
 
     def test_newer_kernel_fq_bands_can_be_rebuilt(self):
         options = json.dumps({
@@ -257,6 +259,8 @@ tc() {{
 ip() {
     [[ "$1 $2" == "-br link" ]] || { echo 'FORBIDDEN ip' >> "$EVENTS"; return 99; }
     printf '%s\\n' 'lo UNKNOWN 00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>'
+    printf '%s\\n' 'bond0 DOWN 00:00:00:00:00:00 <BROADCAST,MULTICAST>'
+    printf '%s\\n' 'sit0 DOWN 00:00:00:00:00:00 <NOARP>'
     printf '%s\\n' 'eth0 UP 52:54:00:6b:c5:8c <BROADCAST,MULTICAST,UP,LOWER_UP>'
     printf '%s\\n' 'ens5@if2 UP 06:0c:3b:62:d4:cd <BROADCAST,MULTICAST,UP,LOWER_UP>'
 }
@@ -266,6 +270,8 @@ ip() {
         self.assertIn('1. eth0', proc.stdout)
         self.assertIn('2. ens5', proc.stdout)
         self.assertNotIn(' lo', proc.stdout)
+        self.assertNotIn('sit0', proc.stdout)
+        self.assertNotIn('bond0', proc.stdout)
         self.assertNotEqual(self.run_shell('pacing_pick_iface <<< 9', setup).returncode, 0)
         self.assertNotEqual(self.run_shell("pacing_pick_iface <<< ''", setup).returncode, 0)
 
@@ -644,6 +650,22 @@ tc() {
         self.assertEqual(policy['version'], 2)
         items = {item['iface']: item['rate'] for item in policy['items']}
         self.assertEqual(items, {'eth0': 10485760, 'tun0': 20971520})
+
+    def test_migrate_is_noop_when_root_fq_already_addressable(self):
+        setup = '''
+tc() {
+    printf '%s\\n' "$*" >> "$EVENTS"
+    if [[ "$1" == -j ]]; then
+        jq -c --arg dev eth0 '[.[$dev]]' "$KERNEL"
+    else
+        echo 'FORBIDDEN tc command' >> "$EVENTS"; return 99
+    fi
+}
+'''
+        proc = self.ok('pacing_migrate_zero_mq eth0', setup)
+        self.assertIn('无需迁移', proc.stdout)
+        self.assertNotIn('qdisc replace', self.events.read_text())
+        self.assertNotIn('qdisc del', self.events.read_text())
 
     def test_ensure_addressable_migrates_zero_or_partial_mq(self):
         setup = '''
