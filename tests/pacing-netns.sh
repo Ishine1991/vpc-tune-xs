@@ -17,6 +17,10 @@ source <(sed -n '/^# TCP\/FQ 每流限速：/,/^#启用BBR+cake/{ /^#启用BBR+c
 PACING_CONFIG_FILE="$work/state.json"
 PACING_SYSCTL_FILE="$work/legacy.conf"
 PACING_LOCK_FILE="$work/lock"
+PACING_STATE_DIR="$work/states"
+PACING_BOOT_RETRY_COUNT=5
+PACING_BOOT_RETRY_SLEEP=0
+mkdir -p -- "$PACING_STATE_DIR"
 ip link add pacingdummy type dummy
 ip link set pacingdummy up
 tc qdisc replace dev pacingdummy root fq limit 1234 flow_limit 45
@@ -55,10 +59,26 @@ if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
     pacing_locked pacing_apply_rate pacingzero 20971520
     pacing_locked pacing_disable
     [[ $(pacing_layout_rate "$(pacing_read_layout pacingzero)") == 4294967295 ]]
+    # Simulate a half-finished migration: nonzero mq root, leaves still handle 0:.
+    root=$(jq -r '.[]|select(.root==true)|.handle' <<< "$(tc -j qdisc show dev pacingzero)")
+    root_hex=${root%:}
+    while IFS= read -r parent; do
+        tc qdisc replace dev pacingzero parent "$parent" handle 0: fq
+    done < <(jq -r '.[]|select(.parent!=null)|.parent' <<< "$(tc -j qdisc show dev pacingzero)")
+    jq -e --arg root "$root" 'any(.[]; .root==true and .handle==$root) and
+      all(.[]|select(.parent!=null); .handle=="0:")' <<< "$(tc -j qdisc show dev pacingzero)" >/dev/null
+    pacing_locked pacing_migrate_zero_mq pacingzero
+    pacing_require_addressable "$(pacing_read_layout pacingzero)"
+    # Option 1 path: recreate default zero handles, then prepare+apply in one step.
+    tc qdisc del dev pacingzero root
+    pacing_locked pacing_prepare_and_apply pacingzero 10485760
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingzero)") == 10485760 ]]
+    pacing_locked pacing_disable
     # Simulate fresh automatic qdiscs at next boot and exercise authorized restore.
     tc qdisc del dev pacingzero root
     PACING_POLICY_FILE="$work/policy.json"
     printf '%s\n' '{"version":1,"iface":"pacingzero","rate":20480}' > "$PACING_POLICY_FILE"
+    rm -f -- "${PACING_CONFIG_FILE}.migrate-pacingzero"
     pacing_locked pacing_restore_boot
     [[ $(pacing_layout_rate "$(pacing_read_layout pacingzero)") == 20480 ]]
     pacing_locked pacing_disable

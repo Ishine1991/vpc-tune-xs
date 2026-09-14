@@ -59,6 +59,9 @@ PACING_LOCK_FILE='{shell_path(self.base / 'lock')}'
 PACING_POLICY_FILE='{shell_path(self.base / 'policy.json')}'
 PACING_SERVICE_FILE='{shell_path(self.base / 'pacing.service')}'
 PACING_INSTALLED_SCRIPT='{shell_path(self.base / 'installed/net-tcp-tune.sh')}'
+PACING_STATE_DIR='{shell_path(self.base / 'states')}'
+PACING_BOOT_RETRY_COUNT=2
+PACING_BOOT_RETRY_SLEEP=0
 KERNEL='{shell_path(self.state)}'
 EVENTS='{shell_path(self.events)}'
 pacing_boot_id() {{ echo boot-1; }}
@@ -149,8 +152,8 @@ tc() {{
                 if item.get('parent')]
 
     def test_decimal_leading_zero_and_units(self):
-        result = self.ok('pacing_parse_rate 08M; pacing_parse_rate 010; pacing_parse_rate 0000; pacing_parse_rate 3G')
-        self.assertEqual(result.stdout.splitlines(), ['8388608', '10240', '0', '3221225472'])
+        result = self.ok('pacing_parse_rate 08M; pacing_parse_rate 010; pacing_parse_rate 0000; pacing_parse_rate 3G; pacing_parse_rate 20K')
+        self.assertEqual(result.stdout.splitlines(), ['8388608', '10485760', '0', '3221225472', '20480'])
 
     def test_migration_option_units(self):
         result = self.ok('pacing_fq_args \'{"limit":10000,"timer_slack":10000,"horizon":10000000,"low_rate_threshold":68750,"horizon_drop":null}\'')
@@ -173,6 +176,12 @@ tc() {{
         self.assertEqual(result.stdout.splitlines()[:3], ['bands', '3', 'priomap'])
         self.ok('pacing_fq_options_match \'{"limit":10000,"weights":[1,2,3]}\' \'{"limit":10000}\'')
         self.assertNotEqual(self.run_shell('pacing_fq_options_match \'{"limit":10000}\' \'{"limit":9999}\'').returncode, 0)
+        result = self.ok('pacing_fq_args \'{"quantum":"3028b","initial_quantum":"15140b","limit":"10000"}\'')
+        lines = result.stdout.splitlines()
+        pairs = dict(zip(lines[::2], lines[1::2]))
+        self.assertEqual(pairs['quantum'], '3028')
+        self.assertEqual(pairs['initial_quantum'], '15140')
+        self.assertEqual(pairs['limit'], '10000')
 
     def test_require_addressable_rejects_zero_handles_on_migrated_mq(self):
         layout = self.base / 'layout.json'
@@ -260,11 +269,15 @@ ip() {
         self.assertNotEqual(self.run_shell('pacing_pick_iface <<< 9', setup).returncode, 0)
         self.assertNotEqual(self.run_shell("pacing_pick_iface <<< ''", setup).returncode, 0)
 
-    def test_bare_number_requires_confirmation(self):
-        proc = self.run_shell("pacing_input_rate <<< $'20\\nn' && exit 1; exit 0")
+    def test_bare_number_is_mib(self):
+        proc = self.ok("pacing_input_rate <<< 20; printf '%s\\n' \"$PACING_INPUT_RATE\"")
+        self.assertEqual(proc.stdout.splitlines()[-1], '20971520')
+
+    def test_kib_suffix_requires_confirmation(self):
+        proc = self.run_shell("pacing_input_rate <<< $'20K\\nn' && exit 1; exit 0")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('0.02 MiB/s', proc.stdout + proc.stderr)
-        proc = self.ok("pacing_input_rate <<< $'20\\ny'; printf '%s\\n' \"$PACING_INPUT_RATE\"")
+        proc = self.ok("pacing_input_rate <<< $'20K\\ny'; printf '%s\\n' \"$PACING_INPUT_RATE\"")
         self.assertEqual(proc.stdout.splitlines()[-1], '20480')
 
     def test_apply_modify_disable_preserves_queue_and_other_iface(self):
@@ -423,7 +436,15 @@ pacing_write_state() { saves=$((saves+1)); [[ $saves != 2 ]] || return 1; origin
         self.assertFalse((self.base / 'policy.json').exists())
         self.assertFalse((self.base / 'pacing.service').exists())
 
-    def test_autostart_downloads_when_not_a_regular_file(self):
+    def test_autostart_copies_running_script_without_download(self):
+        setup = '''systemctl() { printf '%s\n' "$*" >> "$EVENTS"; }
+'''
+        self.ok('pacing_enable_autostart eth0 10485760', setup)
+        self.assertTrue((self.base / 'installed/net-tcp-tune.sh').exists())
+        self.assertIn('pacing_restore_boot', (self.base / 'installed/net-tcp-tune.sh').read_text(encoding='utf-8'))
+        self.assertNotIn('raw.githubusercontent.com', self.events.read_text() if self.events.exists() else '')
+
+    def test_autostart_rejects_unreadable_source_without_download(self):
         setup = '''
 systemctl() { printf '%s\n' "$*" >> "$EVENTS"; }
 PACING_SCRIPT_SOURCE=/dev/fd/63
@@ -433,10 +454,10 @@ curl() {
     printf 'pacing_restore_boot\\n' > "$out"
 }
 '''
-        self.ok('pacing_enable_autostart eth0 10485760', setup)
-        self.assertTrue((self.base / 'installed/net-tcp-tune.sh').exists())
-        self.assertIn('pacing_restore_boot', (self.base / 'installed/net-tcp-tune.sh').read_text())
-        self.assertIn('raw.githubusercontent.com', self.events.read_text())
+        proc = self.run_shell('pacing_enable_autostart eth0 10485760', setup)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.base / 'installed/net-tcp-tune.sh').exists())
+        self.assertNotIn('raw.githubusercontent.com', self.events.read_text() if self.events.exists() else '')
 
     def test_legacy_not_executed_and_blocks_enable(self):
         self.config.write_text('echo CONFIG_EXECUTED\n')
@@ -586,6 +607,38 @@ tc() {
         self.assertTrue(self.config.exists())
         self.assertTrue(old_sysctl.exists())
         self.assertEqual(self.rate(), 10485750)
+
+    def test_second_iface_parks_first_state(self):
+        self.ok('pacing_apply_rate eth0 10485760')
+        self.ok('pacing_apply_rate tun0 20971520')
+        self.assertEqual(self.rate(), 10485760)
+        self.assertEqual(self.rate('tun0'), 20971520)
+        parked = self.base / 'states' / 'eth0.json'
+        self.assertTrue(parked.exists())
+        self.assertEqual(json.loads(parked.read_text())['iface'], 'eth0')
+        self.assertEqual(json.loads(self.config.read_text())['iface'], 'tun0')
+
+    def test_policy_upgrades_to_two_ifaces(self):
+        setup = '''systemctl() { printf '%s\n' "$*" >> "$EVENTS"; }
+'''
+        self.ok('pacing_enable_autostart eth0 10485760', setup)
+        self.ok('pacing_enable_autostart tun0 20971520', setup)
+        policy = json.loads((self.base / 'policy.json').read_text())
+        self.assertEqual(policy['version'], 2)
+        items = {item['iface']: item['rate'] for item in policy['items']}
+        self.assertEqual(items, {'eth0': 10485760, 'tun0': 20971520})
+
+    def test_ensure_addressable_migrates_zero_or_partial_mq(self):
+        setup = '''
+pacing_read_layout() { printf '%s\\n' '{"topology":"mq-fq","targets":[{"parent":":1","handle":"0:","rate":4294967295}]}'; }
+pacing_is_default_zero_mq() { return 0; }
+pacing_is_partial_migrate() { return 1; }
+pacing_migrate_zero_mq() { printf 'migrated %s\\n' "$1"; }
+tc() { printf '%s\\n' "$*" >> "$EVENTS"; echo '[]'; }
+'''
+        proc = self.ok('pacing_ensure_addressable eth0', setup)
+        self.assertIn('migrated eth0', proc.stdout)
+        self.assertNotIn('qdisc del', self.events.read_text() if self.events.exists() else '')
 
 
 if __name__ == '__main__':

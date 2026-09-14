@@ -3,8 +3,8 @@
 # BBR v3 终极优化脚本 - 融合版
 # 功能：结合 XanMod 官方内核的稳定性 + 专业队列算法调优
 # 特点：安全性 + 性能 双优化
-# 版本：2.2 Ultimate Edition
-# 更新：安全下载校验 + MSS 规则安全处理 + Realm 依赖预检
+# 版本：2.4 Ultimate Edition
+# 更新：FQ 每流限速自动迁移 + 开机恢复钉版本 + CAKE 互斥处理
 #=============================================================================
 
 #=============================================================================
@@ -63,7 +63,7 @@ SYSCTL_CONF="/etc/sysctl.d/99-bbr-ultimate.conf"
 #=============================================================================
 
 # 版本号
-readonly SCRIPT_VERSION="2.3"
+readonly SCRIPT_VERSION="2.4"
 readonly CADDY_DEFAULT_VERSION="2.7.6"
 readonly SNELL_DEFAULT_VERSION="5.0.1"
 
@@ -299,6 +299,8 @@ run_remote_script() {
         echo -e "${gl_hong}❌ 无法创建临时文件${gl_bai}"
         return 1
     }
+
+    echo -e "${gl_huang}即将下载并执行第三方脚本（未钉版本、无校验和）: ${url}${gl_bai}"
 
     if ! safe_download_script "$url" "$tmp_file"; then
         echo -e "${gl_hong}❌ 下载脚本失败: ${url}${gl_bai}"
@@ -7196,14 +7198,14 @@ show_main_menu() {
     echo "33. zywe_realm转发脚本（查看原版仓库）"
     echo "34. F佬一键sing box脚本"
     echo "35. 科技lion脚本"
-    echo "36. NS论坛CAKE调优"
+    echo "36. NS论坛CAKE调优（与 39 互斥：会改 default_qdisc=cake）"
     echo "37. 科技lion高性能模式"
-    echo ""
-    echo -e "${gl_kjlan}━━━━━━━━━━ 流量整形 ━━━━━━━━━━${gl_bai}"
-    echo "39. FQ每流限速管理（保留现有TCP参数）"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━ AI 代理服务 ━━━━━━━━━${gl_bai}"
     echo "38. AI代理工具箱 ▶ (Claude/WebUI/CRS/Fuclaude/Caddy) ⭐ 推荐"
+    echo ""
+    echo -e "${gl_kjlan}━━━━━━━━━━ 流量整形 ━━━━━━━━━━${gl_bai}"
+    echo "39. FQ每流限速（出站每流含UDP，不是整卡；零handle mq会自动迁移）"
     echo ""
     echo -e "${gl_hong}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
     echo -e "${gl_hong}99. 完全卸载脚本（卸载所有内容）${gl_bai}"
@@ -11382,7 +11384,10 @@ PACING_LOCK_FILE="/run/net-tcp-tune-pacing.lock"
 PACING_POLICY_FILE="/etc/net-tcp-tune-pacing-policy.json"
 PACING_SERVICE_FILE="/etc/systemd/system/net-tcp-tune-pacing.service"
 PACING_INSTALLED_SCRIPT="/usr/local/lib/net-tcp-tune/net-tcp-tune.sh"
-PACING_PUBLISHED_SCRIPT_URL="https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh"
+PACING_STATE_DIR="${PACING_STATE_DIR:-/etc/net-tcp-tune-pacing.d}"
+PACING_BOOT_RETRY_COUNT="${PACING_BOOT_RETRY_COUNT:-30}"
+PACING_BOOT_RETRY_SLEEP="${PACING_BOOT_RETRY_SLEEP:-2}"
+PACING_MQ_MAX_QUEUES="${PACING_MQ_MAX_QUEUES:-2048}"
 
 pacing_error() { echo "错误: $*" >&2; }
 
@@ -11413,10 +11418,22 @@ pacing_dependencies() {
         os_id="${ID,,}"
         os_like="${ID_LIKE,,}"
     fi
-    if [[ $EUID -eq 0 && "${os_id} ${os_like}" =~ (debian|ubuntu) ]] && command -v apt-get >/dev/null; then
+    if [[ $EUID -eq 0 ]]; then
         echo "选项 39 缺少 ${missing[*]}，正在安装 ${packages[*]}..."
-        if DEBIAN_FRONTEND=noninteractive apt-get update &&
-           DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"; then
+        if [[ "${os_id} ${os_like}" =~ (debian|ubuntu) ]] && command -v apt-get >/dev/null; then
+            DEBIAN_FRONTEND=noninteractive apt-get update &&
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+        elif command -v dnf >/dev/null; then
+            dnf install -y "${packages[@]}"
+        elif command -v yum >/dev/null; then
+            yum install -y "${packages[@]}"
+        elif command -v apk >/dev/null; then
+            apk add --no-cache "${packages[@]}"
+        else
+            pacing_error "缺少 ${missing[*]}；请安装 ${packages[*]} 后重试。"
+            return 1
+        fi
+        if (($? == 0)); then
             for tool in tc ip jq flock mktemp install; do
                 command -v "$tool" >/dev/null || {
                     pacing_error "安装完成后仍找不到 $tool。"
@@ -11426,7 +11443,7 @@ pacing_dependencies() {
             echo "选项 39 的依赖已安装完成。"
             return 0
         fi
-        pacing_error "自动安装依赖失败；请检查上方 apt 输出。"
+        pacing_error "自动安装依赖失败；请检查上方包管理器输出。"
         return 1
     fi
 
@@ -11446,7 +11463,9 @@ pacing_parse_rate() {
     while [[ ${#num} -gt 1 && "$num" == 0* ]]; do num="${num#0}"; done
     [[ ${#num} -le 10 ]] || return 1
     case "$unit" in
-        M|m) factor=1048576;; G|g) factor=1073741824;; *) factor=1024;;
+        K|k) factor=1024;;
+        G|g) factor=1073741824;;
+        *) factor=1048576;;
     esac
     # 在乘法前校验，避免 Bash 整数溢出；强制十进制，接受 08M。
     (( 10#$num <= 4294967294 / factor )) || return 1
@@ -11463,17 +11482,18 @@ pacing_human_rate() {
 
 pacing_input_rate() {
     local input confirm
-    echo "单位 K/M/G = KiB/MiB/GiB 每秒；纯数字为 KiB/s。0 = 关闭本功能。"
-    echo "例如 20M = 20 MiB/s；只输入 20 = 20 KiB/s。"
-    read -r -p "每流上限（例如 20M；回车取消）: " input || return 1
+    echo "出站每流上限（含 TCP/UDP，不是整卡总带宽，不管入站）。"
+    echo "单位：纯数字或 M = MiB/s，K = KiB/s，G = GiB/s。0 = 关闭本功能。"
+    echo "例如 20 或 20M = 20 MiB/s；20K = 20 KiB/s。"
+    read -r -p "每流上限（例如 20；回车取消）: " input || return 1
     [[ -n "$input" ]] || return 1
     PACING_INPUT_RATE=$(pacing_parse_rate "$input") || {
         pacing_error "请输入有效整数速率，且小于 4 GiB/s。"; return 1;
     }
-    if (( PACING_INPUT_RATE > 0 && PACING_INPUT_RATE < 1048576 )) && [[ ! "$input" =~ [KkMmGg]$ ]]; then
+    if (( PACING_INPUT_RATE > 0 && PACING_INPUT_RATE < 1048576 )); then
         echo "注意: 输入 $input 将设置为 $(pacing_human_rate "$PACING_INPUT_RATE")"
-        echo "若要约 ${input} MiB/s，请取消后改输入 ${input}M。"
-        read -r -p "确认使用该速率？[y/N]: " confirm || return 1
+        echo "若要约更快的速率，请取消后输入纯数字或 M 后缀（按 MiB/s）。"
+        read -r -p "确认使用该较慢速率？[y/N]: " confirm || return 1
         [[ "$confirm" =~ ^[Yy]$ ]] || return 1
     fi
 }
@@ -11574,7 +11594,8 @@ pacing_fq_args() {
     jq -er --arg skip_weights "${PACING_FQ_SKIP_WEIGHTS:-0}" '
       def intish:
         if type == "number" then floor
-        elif type == "string" then (tonumber | floor)
+        elif type == "string" then
+          (capture("^(?<n>[0-9]+)") | .n | tonumber | floor)
         else error("invalid integer") end;
       with_entries(.key |= gsub("^\\s+|\\s+$";"")) |
       (if has("bands") or has("priomap") then
@@ -11597,7 +11618,7 @@ pacing_fq_args() {
         if (.key | IN("limit","flow_limit","buckets","orphan_mask","quantum","initial_quantum")) then
           if ((.value | intish) >= 0) then [.key,((.value|intish)|tostring)] else error("invalid integer") end
         elif (.key | IN("maxrate","defrate","low_rate_threshold")) then
-          if (.value | type == "number" and . >= 0 and . == floor) then [.key,((.value*8|tostring)+"bit")] else error("invalid rate") end
+          if ((.value | intish) >= 0) then [.key,(((.value|intish)*8|tostring)+"bit")] else error("invalid rate") end
         elif (.key | IN("refill_delay","ce_threshold","horizon","offload_horizon","timer_slack")) then
           if (.value | type == "number" and . >= 0 and . == floor) then [.key,((.value|tostring)+(if .key == "timer_slack" then "ns" else "us" end))] else error("invalid time") end
         elif .key == "pacing" and (.value|type) == "boolean" then
@@ -11621,6 +11642,66 @@ pacing_is_default_zero_mq() {
         (.options.maxrate // 4294967295) == 4294967295)' <<< "$1" >/dev/null
 }
 
+pacing_mq_root_handle() {
+    jq -er '[.[]|select(.root == true and .kind == "mq")] |
+        if length == 1 then .[0].handle else error("mq root missing") end' <<< "$1"
+}
+
+pacing_is_partial_migrate() {
+    jq -e '
+      ([.[]|select(.root == true and .kind == "mq" and .handle != "0:" and
+        (.handle|test("^[0-9a-fA-F]+:$")))]|length == 1) and
+      ([.[]|select(.parent != null)]|length > 0) and
+      all(.[]|select(.parent != null); .kind == "fq" and .handle == "0:" and
+        (.parent|test("^[0-9a-fA-F]+:[0-9a-fA-F]+$")))' <<< "$1" >/dev/null
+}
+
+pacing_pick_mq_root_handle() {
+    local data="$1" used candidate
+    used=$(jq -r '.[] | (.handle // empty) | rtrimstr(":")' <<< "$data")
+    for candidate in 7ffe 7ffd 7ffc 7ffb 7ffa 7ff9 7ff8 7ff7 7ff6 7ff5; do
+        grep -qx "$candidate" <<< "$used" && continue
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    pacing_error "没有可用的 mq 根 handle。"
+    return 1
+}
+
+pacing_leaf_handle() {
+    local minor="$1" root_hex="$2" leaf
+    (( 16#$minor > 0 && 16#$minor <= 10#$PACING_MQ_MAX_QUEUES )) || return 1
+    leaf=$((0x7000 + 16#$minor))
+    (( leaf != 16#$root_hex && leaf <= 0xffff )) || return 1
+    printf '%x:' "$leaf"
+}
+
+pacing_layout_addressable() {
+    jq -e '
+      .topology != "mq-fq" or
+      all(.targets[]?;
+        ((.parent // "" | startswith(":")) | not) and
+        (((( .parent // "" | test("^7f[0-9a-fA-F]{2}:")) and ((.handle // "") == "0:")) | not)))' \
+        <<< "$1" >/dev/null
+}
+
+pacing_wait_iface() {
+    local iface="$1" i
+    local tries="${PACING_BOOT_RETRY_COUNT:-30}"
+    local delay="${PACING_BOOT_RETRY_SLEEP:-2}"
+    [[ "$tries" =~ ^[0-9]+$ ]] || tries=30
+    [[ "$delay" =~ ^[0-9]+$ ]] || delay=2
+    for ((i=0; i<tries; i++)); do
+        if [[ -e "/sys/class/net/$iface" ]] && pacing_read_layout "$iface" >/dev/null 2>&1; then
+            return 0
+        fi
+        (( i + 1 < tries )) || break
+        sleep "$delay"
+    done
+    pacing_error "网卡 $iface 在 ${tries} 次重试后仍未就绪，或当前队列不受支持。"
+    return 1
+}
+
 pacing_fq_options_match() {
     jq -e --argjson expected "$2" '
       def norm:
@@ -11629,22 +11710,22 @@ pacing_fq_options_match() {
       norm | contains($expected | norm)' <<< "$1" >/dev/null
 }
 
-# Finish a partial migration: root mq is already 7ffe:, but leaves still use handle 0:.
+# Finish a partial migration: root mq already has a nonzero handle, leaves still use handle 0:.
 pacing_migrate_mq_leaves() {
-    local iface="$1" data="$2" backup after failed=0
+    local iface="$1" data="$2" backup after failed=0 root root_hex
     local -a parents=() commands=() args=()
     local parent minor handle options encoded
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
-    jq -e 'any(.[]; .root == true and .kind == "mq" and .handle == "7ffe:") and
-      ([.[]|select(.parent != null)]|length > 0) and
-      all(.[]|select(.parent != null); .kind == "fq" and .handle == "0:" and
-        (.parent|test("^7ffe:[0-9a-fA-F]+$")))' <<< "$data" >/dev/null || {
+    pacing_is_partial_migrate "$data" || {
         pacing_error "当前不是可修复的未完成迁移布局。"; return 1;
     }
+    root=$(pacing_mq_root_handle "$data") || return 1
+    root_hex=${root%:}
     mapfile -t parents < <(jq -r '[.[]|select(.parent != null)|.parent]|sort[]' <<< "$data")
     for parent in "${parents[@]}"; do
-        minor=${parent#7ffe:}
-        (( 16#$minor > 0 && 16#$minor <= 256 )) || return 1
+        [[ "$parent" == "$root_hex:"* ]] || { pacing_error "叶子 parent 与根 handle 不一致。"; return 1; }
+        minor=${parent#${root_hex}:}
+        handle=$(pacing_leaf_handle "$minor" "$root_hex") || return 1
         options=$(jq -ce --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
         PACING_FQ_SKIP_WEIGHTS=1
         encoded=$(pacing_fq_args "$options") || { pacing_error "FQ 参数不能安全重建，未修改队列。"; return 1; }
@@ -11654,26 +11735,26 @@ pacing_migrate_mq_leaves() {
     pacing_write_file "$backup" 600 "$data" || return 1
     echo "未完成迁移的队列参数已保存到 $backup"
     for ((minor=0; minor<${#parents[@]}; minor++)); do
-        parent=${parents[minor]#7ffe:}
-        printf -v handle '%x:' "$((0x7000 + 16#$parent))"
+        parent=${parents[minor]#${root_hex}:}
+        handle=$(pacing_leaf_handle "$parent" "$root_hex") || return 1
         mapfile -t args < <(printf '%s\n' "${commands[minor]}" | sed '/^$/d')
-        tc qdisc replace dev "$iface" parent "7ffe:$parent" handle "$handle" fq "${args[@]}" || failed=1
+        tc qdisc replace dev "$iface" parent "${root_hex}:$parent" handle "$handle" fq "${args[@]}" || failed=1
     done
     after=$(tc -j -d qdisc show dev "$iface") || failed=1
     for parent in "${parents[@]}"; do
         options=$(jq -c --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
-        minor=${parent#7ffe:}
-        printf -v handle '%x:' "$((0x7000 + 16#$minor))"
+        minor=${parent#${root_hex}:}
+        handle=$(pacing_leaf_handle "$minor" "$root_hex") || return 1
         leaf=$(jq -ce --arg parent "$parent" --arg handle "$handle" \
             '.[]|select(.parent == $parent and .kind == "fq" and .handle == $handle)|.options' <<< "$after") \
             || { failed=1; continue; }
         pacing_fq_options_match "$leaf" "$options" || failed=1
     done
     if (( failed )); then
-        pacing_error "迁移修复未完整验证。已保留参数 $backup；请用 [3] 检查。"
+        pacing_error "迁移修复未完整验证。已保留根队列和参数 $backup；请用 [3] 检查后重试。"
         return 1
     fi
-    pacing_write_file "${PACING_CONFIG_FILE}.migrate-${iface}" 600 "$iface" || return 1
+    pacing_write_file "${PACING_CONFIG_FILE}.migrate-${iface}" 600 "$iface $root" || return 1
     echo "已修复 FQ 叶子为非零 handle；现在可选择 [1] 限速。"
     return 0
 }
@@ -11681,12 +11762,11 @@ pacing_migrate_mq_leaves() {
 # Explicitly authorized migration. Backups are evidence, not a promise to restore
 # the kernel-created zero handles or packets discarded by root replacement.
 pacing_migrate_zero_mq() {
-    local iface="$1" data layout state options encoded parent minor handle backup after leaf left right filters failed=0
+    local iface="$1" data layout state options encoded parent minor handle backup after leaf left right filters failed=0 root_hex
     local -a parents=() commands=() args=()
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     data=$(tc -j -d qdisc show dev "$iface") || return 1
-    if jq -e 'any(.[]; .root == true and .kind == "mq" and .handle == "7ffe:") and
-        all(.[]|select(.parent != null); .kind == "fq" and .handle == "0:")' <<< "$data" >/dev/null; then
+    if pacing_is_partial_migrate "$data"; then
         pacing_migrate_mq_leaves "$iface" "$data"
         return $?
     fi
@@ -11703,10 +11783,11 @@ pacing_migrate_zero_mq() {
         pacing_same_layout "$state" "$layout" || return 1
         [[ $(jq -r .phase <<< "$state") == pending ]] || return 1
     fi
+    root_hex=$(pacing_pick_mq_root_handle "$data") || return 1
     mapfile -t parents < <(jq -r '.targets[].parent' <<< "$layout")
     for parent in "${parents[@]}"; do
         minor=${parent#:}
-        (( 16#$minor > 0 && 16#$minor <= 256 )) || return 1
+        handle=$(pacing_leaf_handle "$minor" "$root_hex") || return 1
         options=$(jq -ce --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
         PACING_FQ_SKIP_WEIGHTS=1
         encoded=$(pacing_fq_args "$options") || { pacing_error "FQ 参数不能安全重建，未修改队列。"; return 1; }
@@ -11722,34 +11803,33 @@ pacing_migrate_zero_mq() {
     [[ "$left" == "$right" ]] || {
         pacing_error "备份期间队列发生变化，未执行迁移。"; return 1;
     }
-    tc qdisc replace dev "$iface" root handle 7ffe: mq || return 1
+    tc qdisc replace dev "$iface" root handle "${root_hex}:" mq || return 1
     # Try every leaf even after an error, maximizing preservation of old options.
     for ((minor=0; minor<${#parents[@]}; minor++)); do
         parent=${parents[minor]#:}
-        printf -v handle '%x:' "$((0x7000 + 16#$parent))"
+        handle=$(pacing_leaf_handle "$parent" "$root_hex") || { failed=1; continue; }
         mapfile -t args < <(printf '%s\n' "${commands[minor]}" | sed '/^$/d')
-        tc qdisc replace dev "$iface" parent "7ffe:$parent" handle "$handle" fq "${args[@]}" || failed=1
+        tc qdisc replace dev "$iface" parent "${root_hex}:$parent" handle "$handle" fq "${args[@]}" || failed=1
     done
     after=$(tc -j -d qdisc show dev "$iface") || failed=1
-    jq -e --argjson count "${#parents[@]}" '
-      any(.[]; .root == true and .kind == "mq" and .handle == "7ffe:") and
+    jq -e --argjson count "${#parents[@]}" --arg handle "${root_hex}:" '
+      any(.[]; .root == true and .kind == "mq" and .handle == $handle) and
       ([.[]|select(.parent != null)]|length == $count)' <<< "$after" >/dev/null || failed=1
     for parent in "${parents[@]}"; do
         options=$(jq -c --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
         minor=${parent#:}
-        printf -v handle '%x:' "$((0x7000 + 16#$minor))"
-        leaf=$(jq -ce --arg parent "7ffe:$minor" --arg handle "$handle" \
+        handle=$(pacing_leaf_handle "$minor" "$root_hex") || { failed=1; continue; }
+        leaf=$(jq -ce --arg parent "${root_hex}:$minor" --arg handle "$handle" \
             '.[]|select(.parent == $parent and .kind == "fq" and .handle == $handle)|.options' <<< "$after") \
             || { failed=1; continue; }
         pacing_fq_options_match "$leaf" "$options" || failed=1
     done
     if (( failed )); then
-        tc qdisc del dev "$iface" root 2>/dev/null || true
-        pacing_error "迁移未完整验证，已尝试删除损坏的根队列。原始参数 $backup；请用 [3] 检查，必要时重启网卡或 VPS。"
+        pacing_error "迁移未完整验证，已保留当前根队列（未删除）。原始参数 $backup；请用 [3] 检查后重试 [1] 或 [7]。"
         return 1
     fi
     [[ ! -e "$PACING_CONFIG_FILE" ]] || mv -- "$PACING_CONFIG_FILE" "${backup}.pending" || return 1
-    pacing_write_file "${PACING_CONFIG_FILE}.migrate-${iface}" 600 "$iface" || return 1
+    pacing_write_file "${PACING_CONFIG_FILE}.migrate-${iface}" 600 "$iface ${root_hex}:" || return 1
     echo "已迁移为非零 handle 的 mq + FQ，原 FQ 参数已读回验证；现在可选择 [1] 限速。"
     echo "关闭限速仅恢复上限，不会恢复零 handle；迁移时排队的数据包无法恢复。"
 }
@@ -11770,15 +11850,30 @@ pacing_layout_rate() {
 }
 
 pacing_require_addressable() {
-    if jq -e '
-      .topology == "mq-fq" and
-      any(.targets[]?; type == "object" and
-        ((.parent // "" | startswith(":")) or
-         ((.parent // "" | startswith("7ffe:")) and ((.handle // "") == "0:"))))' \
-        <<< "$1" >/dev/null; then
-        pacing_error "FQ 叶子仍为不可定址的零 handle；请先选择 [7] 完成迁移，再选择 [1]。"
+    if ! pacing_layout_addressable "$1"; then
+        pacing_error "FQ 叶子仍为不可定址的零 handle；选项 [1] 会自动迁移，也可手动选择 [7]。"
         return 1
     fi
+}
+
+pacing_ensure_addressable() {
+    local iface="$1" data layout
+    layout=$(pacing_read_layout "$iface") || return 1
+    if pacing_layout_addressable "$layout"; then
+        return 0
+    fi
+    data=$(tc -j -d qdisc show dev "$iface") || return 1
+    if pacing_is_default_zero_mq "$data" || pacing_is_partial_migrate "$data"; then
+        echo "正在把 $iface 的零 handle mq 迁成可定址队列（可能短暂丢包）..."
+        pacing_migrate_zero_mq "$iface" || return 1
+        return 0
+    fi
+    pacing_require_addressable "$layout"
+}
+
+pacing_prepare_and_apply() {
+    pacing_ensure_addressable "$1" || return 1
+    pacing_apply_rate "$1" "$2"
 }
 
 pacing_normalize_state() {
@@ -11808,8 +11903,8 @@ pacing_change_target() {
     local -a attach handle_args=()
     if [[ "$parent" == root ]]; then attach=(root); else attach=(parent "$parent"); fi
     if [[ "$handle" == "0:" && "$parent" != root ]]; then
-        [[ "$parent" =~ ^7ffe:[0-9a-fA-F]+$ ]] && {
-            pacing_error "FQ 叶子仍为不可定址的零 handle；请先选择 [7] 完成迁移。"
+        [[ "$parent" =~ ^7f[0-9a-fA-F]{2}:[0-9a-fA-F]+$ ]] && {
+            pacing_error "FQ 叶子仍为不可定址的零 handle；选项 [1] 会自动修复，也可手动选择 [7]。"
             return 1
         }
     fi
@@ -11892,7 +11987,8 @@ pacing_write_state() {
 }
 
 pacing_read_state() {
-    [[ -f "$PACING_CONFIG_FILE" ]] || return 1
+    local file="${1:-$PACING_CONFIG_FILE}"
+    [[ -f "$file" ]] || return 1
     # 旧版 shell 配置只检测不 source，避免执行配置内容。
     jq -ce 'select((.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and
         (.boot | type == "string") and
@@ -11906,7 +12002,7 @@ pacing_read_state() {
          (.version == 3 and (.topology == "root-fq" or .topology == "mq-fq") and
           (.targets | type == "array" and length > 0 and
            all(.[]; (.parent == "root" or (.parent | test("^([0-9a-fA-F]+)?:[0-9a-fA-F]+$"))) and
-               (.handle | test("^[0-9a-fA-F]+:$")))))))' "$PACING_CONFIG_FILE" 2>/dev/null
+               (.handle | test("^[0-9a-fA-F]+:$")))))))' "$file" 2>/dev/null
 }
 
 pacing_write_file() {
@@ -11921,9 +12017,22 @@ pacing_write_file() {
 
 pacing_read_policy() {
     [[ -f "$PACING_POLICY_FILE" ]] || return 1
-    jq -ce 'select(.version == 1 and (.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and
-        .iface != "lo" and (.rate | type == "number" and . > 0 and
-        . < 4294967295 and . == floor))' "$PACING_POLICY_FILE" 2>/dev/null
+    jq -ce 'select(
+        (.version == 1 and (.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and
+         .iface != "lo" and (.rate | type == "number" and . > 0 and
+         . < 4294967295 and . == floor)) or
+        (.version == 2 and (.items | type == "array" and length > 0 and
+         all(.[]; (.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and .iface != "lo" and
+             (.rate | type == "number" and . > 0 and . < 4294967295 and . == floor))))
+      )' "$PACING_POLICY_FILE" 2>/dev/null
+}
+
+pacing_policy_items() {
+    local policy="${1:-}"
+    [[ -n "$policy" ]] || policy=$(pacing_read_policy) || return 1
+    jq -ce '
+      if .version == 1 then [{iface:.iface,rate:.rate}]
+      else [.items[]] end' <<< "$policy"
 }
 
 pacing_install_running_script() {
@@ -11932,21 +12041,20 @@ pacing_install_running_script() {
     mkdir -p -- "${dest%/*}" || return 1
     if [[ -f "$source" && -r "$source" ]]; then
         install -m 700 -- "$source" "$tmp" || return 1
-    elif command -v curl >/dev/null; then
-        echo "当前为在线运行，正在下载脚本副本以安装开机恢复..."
-        curl -fsSL "${PACING_PUBLISHED_SCRIPT_URL}?$(date +%s)" -o "$tmp" || {
-            pacing_error "无法下载开机恢复脚本。"; rm -f -- "$tmp"; return 1
-        }
+    elif [[ -r "$source" ]]; then
+        # bash <(...) 的进程替换仍可读；只保存当前这份，不再回拉 main。
+        cat -- "$source" > "$tmp" || { rm -f -- "$tmp"; return 1; }
         chmod 700 "$tmp" || { rm -f -- "$tmp"; return 1; }
-        grep -q 'pacing_restore_boot' "$tmp" || {
-            pacing_error "下载的脚本不完整，未安装开机恢复。"
-            rm -f -- "$tmp"
-            return 1
-        }
     else
-        pacing_error "请先下载脚本为普通文件再运行，才能安装开机恢复。"
+        pacing_error "无法读取当前运行的脚本，未安装开机恢复。请先把脚本保存为普通文件再运行。"
+        rm -f -- "$tmp"
         return 1
     fi
+    grep -q 'pacing_restore_boot' "$tmp" || {
+        pacing_error "当前脚本不完整，未安装开机恢复。"
+        rm -f -- "$tmp"
+        return 1
+    }
     mv -f -- "$tmp" "$dest"
 }
 
@@ -11975,8 +12083,17 @@ WantedBy=multi-user.target'
     pacing_write_file "$PACING_SERVICE_FILE" 644 "$unit" || return 1
     systemctl daemon-reload || return 1
     systemctl enable net-tcp-tune-pacing.service || return 1
-    policy=$(jq -cn --arg iface "$iface" --argjson rate "$rate" \
-        '{version:1,iface:$iface,rate:$rate}') || return 1
+    if existing=$(pacing_read_policy 2>/dev/null); then
+        policy=$(jq -cn --argjson existing "$existing" --arg iface "$iface" --argjson rate "$rate" '
+            (if $existing.version == 1 then [{iface:$existing.iface,rate:$existing.rate}]
+             else $existing.items end)
+            | map(select(.iface != $iface)) + [{iface:$iface,rate:$rate}]
+            | if length == 1 then {version:1,iface:.[0].iface,rate:.[0].rate}
+              else {version:2,items:.} end') || return 1
+    else
+        policy=$(jq -cn --arg iface "$iface" --argjson rate "$rate" \
+            '{version:1,iface:$iface,rate:$rate}') || return 1
+    fi
     pacing_write_file "$PACING_POLICY_FILE" 600 "$policy" || return 1
     echo "已启用开机自动恢复限速。"
 }
@@ -12002,6 +12119,7 @@ pacing_same_device() {
     }
 }
 
+# 仅供旧版根 FQ 清理使用；日常限速走 pacing_set_layout_rate。
 pacing_set_rate() {
     local iface="$1" rate="$2" expected_state="${3:-}" allowed_rates="${4:-}" root current
     local -a handle_args=()
@@ -12055,9 +12173,18 @@ pacing_apply_rate() {
     if [[ -f "$PACING_CONFIG_FILE" ]]; then
         old=$(pacing_read_state) || { pacing_error "配置为旧版或损坏，请先处理。"; return 1; }
         old=$(pacing_normalize_state "$old") || return 1
-        [[ $(jq -r .iface <<< "$old") == "$iface" ]] || {
-            pacing_error "请先关闭原接口的限速。"; return 1;
-        }
+        if [[ $(jq -r .iface <<< "$old") != "$iface" ]]; then
+            mkdir -p -- "$PACING_STATE_DIR" || return 1
+            mv -- "$PACING_CONFIG_FILE" "$PACING_STATE_DIR/$(jq -r .iface <<< "$old").json" || return 1
+            old=""
+        fi
+    fi
+    if [[ -z "$old" && -f "$PACING_STATE_DIR/${iface}.json" ]]; then
+        mv -- "$PACING_STATE_DIR/${iface}.json" "$PACING_CONFIG_FILE" || return 1
+        old=$(pacing_read_state) || { pacing_error "已保存的网卡记录损坏。"; return 1; }
+        old=$(pacing_normalize_state "$old") || return 1
+    fi
+    if [[ -n "$old" ]]; then
         pacing_same_layout "$old" "$layout" || return 1
         phase=$(jq -r .phase <<< "$old")
         [[ "$phase" == active && "$before" == "$(jq -r .rate <<< "$old")" ]] || {
@@ -12108,59 +12235,38 @@ pacing_disable() {
 
 # systemd 仅根据独立策略文件恢复；旧启动记录必须验证为过期后才会替换。
 pacing_restore_boot() {
-    local policy iface rate state="" layout before boot ifindex topology targets pending
+    local policy items boot state file iface rate rc=0
     policy=$(pacing_read_policy) || { pacing_error "开机恢复策略不存在或已损坏。"; return 1; }
-    iface=$(jq -r .iface <<< "$policy")
-    rate=$(jq -r .rate <<< "$policy")
+    items=$(pacing_policy_items "$policy") || return 1
     boot=$(pacing_boot_id) && [[ -n "$boot" ]] || return 1
 
     if [[ -f "$PACING_CONFIG_FILE" ]]; then
         state=$(pacing_read_state) || { pacing_error "运行记录损坏，拒绝开机恢复。"; return 1; }
         state=$(pacing_normalize_state "$state") || return 1
-        if [[ $(jq -r .boot <<< "$state") == "$boot" ]]; then
-            [[ $(jq -r .iface <<< "$state") == "$iface" && $(jq -r .rate <<< "$state") == "$rate" ]] || {
-                pacing_error "本次启动已有不同的限速记录。"; return 1;
-            }
-            layout=$(pacing_read_layout "$iface") || return 1
-            pacing_same_layout "$state" "$layout" || return 1
-            [[ $(pacing_layout_rate "$layout") == "$rate" ]] || return 1
-            echo "本次启动的限速已经生效。"
-            return 0
+        if [[ $(jq -r .boot <<< "$state") != "$boot" ]]; then
+            rm -f -- "$PACING_CONFIG_FILE" || return 1
         fi
-        rm -f -- "$PACING_CONFIG_FILE" || return 1
+    fi
+    if [[ -d "$PACING_STATE_DIR" ]]; then
+        for file in "$PACING_STATE_DIR"/*.json; do
+            [[ -f "$file" ]] || continue
+            state=$(pacing_read_state "$file") || { pacing_error "运行记录损坏，拒绝开机恢复。"; return 1; }
+            state=$(pacing_normalize_state "$state") || return 1
+            [[ $(jq -r .boot <<< "$state") == "$boot" ]] || rm -f -- "$file" || return 1
+        done
     fi
 
-    layout=$(pacing_read_layout "$iface") || { pacing_error "网卡 $iface 尚未就绪或 FQ 布局不受支持。"; return 1; }
-    if [[ -f "${PACING_CONFIG_FILE}.migrate-${iface}" ]] &&
-       jq -e '.topology == "mq-fq" and all(.targets[]; .parent|startswith(":"))' <<< "$layout" >/dev/null; then
-        pacing_migrate_zero_mq "$iface" || return 1
-        layout=$(pacing_read_layout "$iface") || return 1
-    fi
-    before=$(pacing_layout_rate "$layout") || {
-        pacing_error "$iface 的各 FQ 发送队列上限不一致，拒绝自动恢复。"; return 1;
-    }
-    [[ "$before" == 4294967295 || "$before" == "$rate" ]] || {
-        pacing_error "$iface 已存在其他上限，拒绝覆盖。"; return 1;
-    }
-    ifindex=$(pacing_ifindex "$iface") && [[ "$ifindex" =~ ^[0-9]+$ ]] || return 1
-    topology=$(jq -r .topology <<< "$layout")
-    targets=$(jq -c '[.targets[] | {parent,handle}]' <<< "$layout") || return 1
-    pending=$(jq -cn --arg iface "$iface" --arg boot "$boot" --arg ifindex "$ifindex" \
-        --arg topology "$topology" --argjson targets "$targets" \
-        --argjson rate "$rate" --argjson previous "$before" \
-        '{version:3,iface:$iface,boot:$boot,ifindex:$ifindex,topology:$topology,targets:$targets,
-          original:4294967295,previous_rate:$previous,rate:$rate,phase:"pending"}') || return 1
-    pacing_write_state "$pending" || return 1
-    if pacing_set_layout_rate "$iface" "$rate" "$pending" "$before $rate" &&
-       pacing_write_state "$(jq -c '.phase="active"' <<< "$pending")"; then
-        echo "已在 $iface 恢复每流上限: $(pacing_human_rate "$rate")"
-        return 0
-    fi
-    pacing_error "开机恢复失败，尝试还原本次修改。"
-    if pacing_set_layout_rate "$iface" "$before" "$pending" "$before $rate"; then
-        rm -f -- "$PACING_CONFIG_FILE"
-    fi
-    return 1
+    while IFS=$'\t' read -r iface rate; do
+        [[ -n "$iface" ]] || continue
+        pacing_wait_iface "$iface" || { rc=1; continue; }
+        pacing_ensure_addressable "$iface" || { rc=1; continue; }
+        if pacing_apply_rate "$iface" "$rate"; then
+            echo "已在 $iface 恢复每流上限: $(pacing_human_rate "$rate")"
+        else
+            rc=1
+        fi
+    done < <(jq -r '.[] | [.iface, (.rate|tostring)] | @tsv' <<< "$items")
+    return $rc
 }
 
 pacing_locked() (
@@ -12170,13 +12276,72 @@ pacing_locked() (
     "$@"
 )
 
+pacing_warn_qdisc_conflict() {
+    local q
+    q=$(sysctl -n net.core.default_qdisc 2>/dev/null) || return 0
+    [[ "$q" == cake ]] || return 0
+    echo "警告: 当前 default_qdisc=cake，与本功能互斥。重启后新网卡会变成 CAKE，开机恢复会失败。"
+}
+
+pacing_known_ifaces() {
+    local state file
+    if [[ -f "$PACING_CONFIG_FILE" ]] && state=$(pacing_read_state); then
+        jq -r .iface <<< "$state"
+    fi
+    if [[ -d "$PACING_STATE_DIR" ]]; then
+        for file in "$PACING_STATE_DIR"/*.json; do
+            [[ -f "$file" ]] || continue
+            state=$(pacing_read_state "$file") || continue
+            jq -r .iface <<< "$state"
+        done
+    fi
+}
+
+pacing_pick_known_iface() {
+    local -a ifaces=()
+    local choice i
+    mapfile -t ifaces < <(pacing_known_ifaces | awk 'NF && !seen[$0]++')
+    ((${#ifaces[@]} > 0)) || { pacing_error "没有可修改的本版本配置。"; return 1; }
+    if ((${#ifaces[@]} == 1)); then
+        PACING_INPUT_IFACE=${ifaces[0]}
+        return 0
+    fi
+    echo "请选择要修改的网卡："
+    for i in "${!ifaces[@]}"; do
+        printf '  %d. %s\n' "$((i + 1))" "${ifaces[i]}"
+    done
+    read -r -p "请输入编号（回车取消）: " choice || return 1
+    [[ "$choice" =~ ^[1-9][0-9]*$ ]] || { pacing_error "请输入有效编号。"; return 1; }
+    ((10#$choice >= 1 && 10#$choice <= ${#ifaces[@]})) || { pacing_error "编号超出范围。"; return 1; }
+    PACING_INPUT_IFACE=${ifaces[$((10#$choice - 1))]}
+}
+
+pacing_disable_states() {
+    local rc=0 file found=0
+    if [[ -f "$PACING_CONFIG_FILE" ]]; then
+        found=1
+        pacing_disable || rc=1
+    fi
+    if [[ -d "$PACING_STATE_DIR" ]]; then
+        for file in "$PACING_STATE_DIR"/*.json; do
+            [[ -f "$file" ]] || continue
+            found=1
+            PACING_CONFIG_FILE="$file" pacing_disable || rc=1
+        done
+    fi
+    (( found )) || { echo "没有本版本的限速记录。"; return 0; }
+    return $rc
+}
+
 pacing_enable_all() {
     pacing_input_rate || return 1
     if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_disable_all; return $?; fi
-    echo "对所选接口的根 FQ，或 mq 下全部 FQ 发送叶子设置每流上限；包含 TCP/UDP 等出站流量。"
-    echo "不会设置 BBR、缩小缓冲区或覆盖其他队列；成功后会设置开机自动恢复。"
+    echo "对所选网卡的出站 FQ 流设置每流上限（含 TCP/UDP，不是整卡总带宽，不管入站）。"
+    echo "不改 BBR / TCP 缓冲区。默认零 handle 的 mq 会自动迁移（可能短暂丢包）。"
+    echo "与菜单 36 的 CAKE 互斥；成功后会安装开机恢复（使用当前这份脚本，不回拉 main）。"
+    pacing_warn_qdisc_conflict
     pacing_pick_iface || return 1
-    if pacing_locked pacing_apply_rate "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"; then
+    if pacing_locked pacing_prepare_and_apply "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"; then
         pacing_enable_autostart "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE" || {
             pacing_error "当前限速已生效，但开机自动恢复设置失败。"
             return 1
@@ -12187,16 +12352,13 @@ pacing_enable_all() {
 }
 
 pacing_modify_rate() {
-    local state
-    state=$(pacing_read_state) || { pacing_error "没有可修改的本版本配置。"; return 1; }
+    pacing_pick_known_iface || return 1
     pacing_input_rate || return 1
     if [[ "$PACING_INPUT_RATE" == 0 ]]; then
-        pacing_disable_autostart && pacing_locked pacing_disable
+        pacing_disable_autostart && pacing_locked pacing_disable_states
     else
-        local iface
-        iface=$(jq -r .iface <<< "$state")
-        if pacing_locked pacing_apply_rate "$iface" "$PACING_INPUT_RATE"; then
-            pacing_enable_autostart "$iface" "$PACING_INPUT_RATE"
+        if pacing_locked pacing_prepare_and_apply "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"; then
+            pacing_enable_autostart "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"
             return $?
         fi
         return 1
@@ -12205,33 +12367,51 @@ pacing_modify_rate() {
 
 pacing_disable_all() {
     pacing_disable_autostart || { pacing_error "无法关闭开机恢复，未修改当前限速。"; return 1; }
-    pacing_locked pacing_disable
+    pacing_locked pacing_disable_states
+}
+
+pacing_status_one() {
+    local file="$1" state iface layout actual
+    state=$(pacing_read_state "$file") || { echo "保存记录: $file 损坏或为旧版，未执行其内容。"; return 0; }
+    state=$(pacing_normalize_state "$state") || return 1
+    iface=$(jq -r .iface <<< "$state")
+    echo "保存记录: $iface / $(jq -r .phase <<< "$state") / $(pacing_human_rate "$(jq -r .rate <<< "$state")")"
+    if layout=$(pacing_read_layout "$iface") && pacing_same_layout "$state" "$layout"; then
+        actual=$(pacing_layout_rate "$layout" 2>/dev/null) || actual="不一致"
+        if [[ "$actual" == "不一致" ]]; then echo "内核当前上限: 各 FQ 发送队列不一致"
+        else echo "内核当前上限: $(pacing_human_rate "$actual")"; fi
+        [[ $(jq -r .phase <<< "$state") == active &&
+           "$actual" == "$(jq -r .rate <<< "$state")" ]] || echo "记录与内核不一致或操作未完成。"
+    else echo "记录已过期或无法读取，不能认定限速生效。"; fi
 }
 
 pacing_status_summary() {
-    local state iface layout policy actual
-    if policy=$(pacing_read_policy); then
-        echo "开机自动恢复: 已启用 ($(jq -r .iface <<< "$policy") / $(pacing_human_rate "$(jq -r .rate <<< "$policy")"))"
+    local policy items file
+    if policy=$(pacing_read_policy) && items=$(pacing_policy_items "$policy"); then
+        echo "开机自动恢复: 已启用"
+        while IFS=$'\t' read -r iface rate; do
+            [[ -n "$iface" ]] || continue
+            echo "  - $iface / $(pacing_human_rate "$rate")"
+        done < <(jq -r '.[] | [.iface, (.rate|tostring)] | @tsv' <<< "$items")
     elif [[ -f "$PACING_POLICY_FILE" ]]; then
         echo "开机自动恢复: 策略损坏，请先关闭限速后重新设置。"
     else
         echo "开机自动恢复: 未启用。"
     fi
-    echo "系统会在开机网络就绪后恢复；网卡被运行时重建时仍需重新设置。"
-    if state=$(pacing_read_state); then
-        state=$(pacing_normalize_state "$state") || return 1
-        iface=$(jq -r .iface <<< "$state")
-        echo "保存记录: $iface / $(jq -r .phase <<< "$state") / $(pacing_human_rate "$(jq -r .rate <<< "$state")")"
-        if layout=$(pacing_read_layout "$iface") && pacing_same_layout "$state" "$layout"; then
-            actual=$(pacing_layout_rate "$layout" 2>/dev/null) || actual="不一致"
-            if [[ "$actual" == "不一致" ]]; then echo "内核当前上限: 各 FQ 发送队列不一致"
-            else echo "内核当前上限: $(pacing_human_rate "$actual")"; fi
-            [[ $(jq -r .phase <<< "$state") == active &&
-               "$actual" == "$(jq -r .rate <<< "$state")" ]] || echo "记录与内核不一致或操作未完成。"
-        else echo "记录已过期或无法读取，不能认定限速生效。"; fi
-    elif [[ -f "$PACING_CONFIG_FILE" ]]; then
-        echo "检测到旧版/损坏的配置；未执行其内容。"
-    else echo "无本版本限速记录；实际队列请通过 [3] 查看。"; fi
+    echo "系统会在开机网络就绪后重试恢复；网卡被运行时重建时仍需重新设置。"
+    echo "本功能限的是出站每流（含 UDP），不是整卡，也不改 TCP 参数。"
+    if [[ -f "$PACING_CONFIG_FILE" ]]; then
+        pacing_status_one "$PACING_CONFIG_FILE"
+    fi
+    if [[ -d "$PACING_STATE_DIR" ]]; then
+        for file in "$PACING_STATE_DIR"/*.json; do
+            [[ -f "$file" ]] || continue
+            pacing_status_one "$file"
+        done
+    fi
+    if [[ ! -f "$PACING_CONFIG_FILE" ]] && ! compgen -G "$PACING_STATE_DIR/*.json" >/dev/null; then
+        echo "无本版本限速记录；实际队列请通过 [3] 查看。"
+    fi
     if [[ -f "$PACING_SYSCTL_FILE" ]]; then
         echo "旧版全局 TCP 调优配置仍存在，请通过 [5] 清理。"
     fi
@@ -12327,15 +12507,30 @@ pacing_legacy_cleanup() {
 }
 
 pacing_forget_stale() {
-    local state boot
-    state=$(pacing_read_state) || return 1
+    local state boot file found=0
     boot=$(pacing_boot_id) && [[ -n "$boot" ]] || {
         pacing_error "无法读取当前启动标识，保留恢复记录。"; return 1;
     }
-    [[ "$boot" != "$(jq -r .boot <<< "$state")" ]] || {
-        pacing_error "同一次启动的记录请使用 [4] 恢复，不能直接删除。"; return 1;
-    }
-    rm -- "$PACING_CONFIG_FILE" || return 1
+    if [[ -f "$PACING_CONFIG_FILE" ]]; then
+        state=$(pacing_read_state) || return 1
+        [[ "$boot" != "$(jq -r .boot <<< "$state")" ]] || {
+            pacing_error "同一次启动的记录请使用 [4] 恢复，不能直接删除。"; return 1;
+        }
+        rm -- "$PACING_CONFIG_FILE" || return 1
+        found=1
+    fi
+    if [[ -d "$PACING_STATE_DIR" ]]; then
+        for file in "$PACING_STATE_DIR"/*.json; do
+            [[ -f "$file" ]] || continue
+            state=$(pacing_read_state "$file") || return 1
+            [[ "$boot" != "$(jq -r .boot <<< "$state")" ]] || {
+                pacing_error "同一次启动的记录请使用 [4] 恢复，不能直接删除。"; return 1;
+            }
+            rm -- "$file" || return 1
+            found=1
+        done
+    fi
+    (( found )) || return 1
     echo "已删除上次启动的记录，未修改当前网络。"
 }
 
@@ -12344,15 +12539,16 @@ manage_tcp_pacing_limit() {
     pacing_dependencies || { break_end; return 1; }
     while true; do
         clear
-        echo "FQ 每流限速管理"
+        echo "FQ 每流限速管理（出站每流，含 TCP/UDP；不是整卡，不管入站）"
+        echo "与菜单 36 CAKE 互斥。纯数字按 MiB/s（20 = 20M）。"
         pacing_status_summary
-        echo "1. 选择网卡并限速（保留现有 TCP 参数）"
+        echo "1. 选择网卡并限速（零 handle mq 会自动迁移）"
         echo "2. 修改速率（0 = 关闭）"
         echo "3. 查看实际队列与 TCP 状态"
         echo "4. 关闭并恢复本版本修改前的上限"
         echo "5. 清理旧版限速及全局调优配置"
         echo "6. 删除上次启动的过期记录"
-        echo "7. 迁移默认零 handle 的 mq + FQ（可能短暂丢包）"
+        echo "7. 手动迁移或修复半完成的 mq（选项 1 会自动做）"
         echo "0. 返回"
         read -r -p "请选择: " choice || return
         case "$choice" in
@@ -12366,10 +12562,33 @@ manage_tcp_pacing_limit() {
 
 
 #启用BBR+cake
+sysctl_conf_upsert() {
+  local file="$1" key="$2" value="$3"
+  mkdir -p -- "$(dirname -- "$file")"
+  if [[ -L "$file" ]]; then
+    echo -e "${gl_huang}警告: $file 是符号链接，将写到其目标。${gl_bai}"
+  fi
+  touch -- "$file"
+  if grep -qE "^[[:space:]]*#?[[:space:]]*${key}=" "$file"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}=.*|${key}=${value}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
 startbbrcake() {
+  local answer
+  echo -e "${gl_huang}警告: 此项把 default_qdisc 改为 cake，与菜单 39 的 FQ 每流限速互斥。${gl_bai}"
+  echo "重启后新网卡会使用 CAKE，第 39 项限速和开机恢复将无法应用。"
+  if [[ -f "${PACING_POLICY_FILE:-/etc/net-tcp-tune-pacing-policy.json}" ||
+        -f "${PACING_CONFIG_FILE:-/etc/net-tcp-tune-pacing.conf}" ]]; then
+    echo "检测到第 39 项限速配置。继续会让该限速在重启后失效。"
+  fi
+  read -r -p "确认改为 BBR+CAKE？[y/N]: " answer || return 1
+  [[ "$answer" =~ ^[Yy]$ ]] || { echo "已取消。"; break_end; return 1; }
   remove_bbr_lotserver
-  echo "net.core.default_qdisc=cake" >>/etc/sysctl.d/99-sysctl.conf
-  echo "net.ipv4.tcp_congestion_control=bbr" >>/etc/sysctl.d/99-sysctl.conf
+  sysctl_conf_upsert /etc/sysctl.d/99-sysctl.conf net.core.default_qdisc cake
+  sysctl_conf_upsert /etc/sysctl.d/99-sysctl.conf net.ipv4.tcp_congestion_control bbr
   sysctl --system
   echo -e "${gl_lv}[信息]${gl_bai}BBR+cake修改成功，重启生效！"
   break_end

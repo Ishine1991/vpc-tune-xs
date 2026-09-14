@@ -66,21 +66,8 @@ uninstall_alias() {
     # 创建临时文件来存储清理后的内容
     TEMP_FILE=$(mktemp)
 
-    # 删除包含 "net-tcp-tune 快捷别名" 的整个块（包括注释和别名）
-    # 先尝试删除从分隔线开始到别名结束的整个块
-    # 如果失败，则只删除别名块本身
-    if grep -q "^# ================" "$RC_FILE" 2>/dev/null; then
-        # 尝试删除从分隔线开始到别名结束的整个块
-        sed '/^# ================/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE" 2>/dev/null
-        # 检查是否还有别名残留
-        if grep -q "net-tcp-tune 快捷别名" "$TEMP_FILE" 2>/dev/null; then
-            # 如果还有残留，使用更精确的删除
-            sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
-        fi
-    else
-        # 直接删除别名块
-        sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
-    fi
+    # 只删除本脚本写入的别名块，避免误删用户其它分隔线配置。
+    sed '/net-tcp-tune 快捷别名/,/^alias bbr=/d' "$RC_FILE" > "$TEMP_FILE"
 
     # 检查是否有变更
     if ! diff -q "$RC_FILE" "$TEMP_FILE" > /dev/null 2>&1; then
