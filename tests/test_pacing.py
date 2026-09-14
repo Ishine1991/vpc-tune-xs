@@ -169,6 +169,29 @@ tc() {{
         self.assertFalse(self.config.exists())
         self.assertNotIn('qdisc change', self.events.read_text())
 
+    def test_real_vps_zero_mq_json_is_migratable(self):
+        sample = json.dumps([
+            {'kind': 'mq', 'handle': '0:', 'root': True, 'options': {}},
+            {'kind': 'fq', 'handle': '0:', 'parent': ':2', 'options': {
+                'limit': 10000, 'flow_limit': 100, 'buckets': 1024,
+                'orphan_mask': 1023, 'quantum': 3028, 'initial_quantum': 15140,
+                'low_rate_threshold': 68750, 'refill_delay': 40000,
+                'timer_slack': 10000, 'horizon': 10000000, 'horizon_drop': None,
+            }},
+            {'kind': 'fq', 'handle': '0:', 'parent': ':1', 'dev': 'eth0',
+             'options': {
+                'limit': 10000, 'flow_limit': 100, 'buckets': 1024,
+                'orphan_mask': 1023, 'quantum': 3028, 'initial_quantum': 15140,
+                'low_rate_threshold': 68750, 'refill_delay': 40000,
+                'timer_slack': 10000, 'horizon': 10000000, 'horizon_drop': None,
+            }},
+        ])
+        self.ok("pacing_is_default_zero_mq '" + sample + "'")
+        extra = json.loads(sample)
+        extra[0]['unknown'] = 1
+        self.assertNotEqual(
+            self.run_shell("pacing_is_default_zero_mq '" + json.dumps(extra) + "'").returncode, 0)
+
     def test_migration_rejects_unknown_or_invalid_options(self):
         for options in ('{"new_option":1}', '{"limit":"oops"}', '{"pacing":null}'):
             with self.subTest(options=options):

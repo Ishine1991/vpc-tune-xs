@@ -11553,19 +11553,27 @@ pacing_fq_args() {
       ) | flatten | .[]' <<< "$1"
 }
 
+# Kernel-created mq leaves often appear as handle 0: / parent :N.
+# iproute2 may also emit metadata keys such as dev or offloaded.
+pacing_is_default_zero_mq() {
+    jq -e 'length > 1 and
+      ([.[]|select(.root == true)]|length == 1) and
+      all(.[]; ((keys - ["kind","handle","parent","root","refcnt","options","dev","offloaded"])|length == 0)) and
+      all(.[]; if .root == true then .kind == "mq" and .handle == "0:" and
+          ((.options // {}) == {})
+        else .kind == "fq" and .handle == "0:" and (.parent|test("^:[0-9a-fA-F]+$"))
+          and (.options.maxrate // 4294967295) == 4294967295 end)' <<< "$1" >/dev/null
+}
+
 # Explicitly authorized migration. Backups are evidence, not a promise to restore
 # the kernel-created zero handles or packets discarded by root replacement.
 pacing_migrate_zero_mq() {
-    local iface="$1" data layout state options encoded parent minor handle backup after leaf failed=0
+    local iface="$1" data layout state options encoded parent minor handle backup after leaf left right failed=0
     local -a parents=() commands=() args=()
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     data=$(tc -j -d qdisc show dev "$iface") || return 1
     layout=$(pacing_read_layout "$iface") || return 1
-    jq -e 'length > 1 and
-      ([.[]|select(.root == true)]|length == 1) and
-      all(.[]; if .root == true then .kind == "mq" and .handle == "0:"
-        else .kind == "fq" and .handle == "0:" and (.parent|test("^:[0-9a-fA-F]+$"))
-          and (.options.maxrate // 4294967295) == 4294967295 end)' <<< "$data" >/dev/null || {
+    pacing_is_default_zero_mq "$data" || {
         pacing_error "仅迁移全部叶子为无限速 FQ 的默认零 handle mq；未修改队列。"; return 1;
     }
     [[ $(tc -j filter show dev "$iface" root) == '[]' ]] || {
@@ -11588,6 +11596,12 @@ pacing_migrate_zero_mq() {
     pacing_write_file "$backup" 600 "$data" || return 1
     [[ ! -e "$PACING_CONFIG_FILE" ]] || cp -p -- "$PACING_CONFIG_FILE" "${backup}.state" || return 1
     echo "原始队列参数已保存到 $backup"
+    after=$(tc -j -d qdisc show dev "$iface") || return 1
+    left=$(jq -cS 'sort_by(.parent // "root")' <<< "$after") || return 1
+    right=$(jq -cS 'sort_by(.parent // "root")' <<< "$data") || return 1
+    [[ "$left" == "$right" ]] || {
+        pacing_error "备份期间队列发生变化，未执行迁移。"; return 1;
+    }
     tc qdisc replace dev "$iface" root handle 7ffe: mq || return 1
     # Try every leaf even after an error, maximizing preservation of old options.
     for ((minor=0; minor<${#parents[@]}; minor++)); do
@@ -11597,6 +11611,9 @@ pacing_migrate_zero_mq() {
         tc qdisc replace dev "$iface" parent "7ffe:$parent" handle "$handle" fq "${args[@]}" || failed=1
     done
     after=$(tc -j -d qdisc show dev "$iface") || failed=1
+    jq -e --argjson count "${#parents[@]}" '
+      any(.[]; .root == true and .kind == "mq" and .handle == "7ffe:") and
+      ([.[]|select(.parent != null)]|length == $count)' <<< "$after" >/dev/null || failed=1
     for parent in "${parents[@]}"; do
         options=$(jq -c --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
         leaf=$(jq -ce --arg parent "7ffe:${parent#:}" '.[]|select(.parent == $parent and .kind == "fq")|.options' <<< "$after") || { failed=1; continue; }
