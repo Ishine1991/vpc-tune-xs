@@ -33,14 +33,22 @@ jq -e '.options.limit == 1234 and .options.flow_limit == 45' <<< "$root" >/dev/n
 [[ ! -e "$PACING_CONFIG_FILE" ]]
 
 # CI sets default_qdisc=fq on its disposable runner, not on a production host.
-# TAP supports automatic mq; veth has IFF_NO_QUEUE even with txqueuelen set.
+# Multi-queue dummy auto-attaches mq + FQ with kernel zero handles; TAP is fallback.
 if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
-    ip tuntap add dev pacingzero mode tap multi_queue
+    ip link add pacingzero numtxqueues 2 type dummy
     ip link set pacingzero up
     zero=$(tc -j -d qdisc show dev pacingzero)
-    echo "Automatic kernel layout: $zero"
-    jq -e 'any(.[]; .kind == "mq" and .root == true and .handle == "0:") and
-      ([.[]|select(.kind == "fq" and .handle == "0:")]|length >= 2)' <<< "$zero" >/dev/null
+    echo "Automatic dummy layout: $zero"
+    if ! jq -e 'any(.[]; .kind == "mq" and .root == true and .handle == "0:") and
+      ([.[]|select(.kind == "fq" and .handle == "0:")]|length >= 1)' <<< "$zero" >/dev/null; then
+        ip link del pacingzero
+        ip tuntap add dev pacingzero mode tap multi_queue
+        ip link set pacingzero up
+        zero=$(tc -j -d qdisc show dev pacingzero)
+        echo "Automatic TAP layout: $zero"
+        jq -e 'any(.[]; .kind == "mq" and .root == true and .handle == "0:") and
+          ([.[]|select(.kind == "fq" and .handle == "0:")]|length >= 1)' <<< "$zero" >/dev/null
+    fi
     pacing_locked pacing_migrate_zero_mq pacingzero
     pacing_locked pacing_apply_rate pacingzero 20480
     [[ $(pacing_layout_rate "$(pacing_read_layout pacingzero)") == 20480 ]]

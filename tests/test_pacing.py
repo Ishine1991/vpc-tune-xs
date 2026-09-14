@@ -156,6 +156,8 @@ tc() {{
         result = self.ok('pacing_fq_args \'{"limit":10000,"timer_slack":10000,"horizon":10000000,"low_rate_threshold":68750,"horizon_drop":null}\'')
         self.assertEqual(result.stdout.splitlines(), ['limit', '10000', 'timer_slack', '10000ns',
             'horizon', '10000000us', 'low_rate_threshold', '550000bit', 'horizon_drop'])
+        result = self.ok('pacing_fq_args \'{"horizon_drop":true}\'')
+        self.assertEqual(result.stdout.splitlines(), ['horizon_drop'])
 
     def test_zero_mq_requires_migration_before_writing_state(self):
         self.write_kernel_mq()
@@ -188,7 +190,7 @@ tc() {{
         ])
         self.ok("pacing_is_default_zero_mq '" + sample + "'")
         extra = json.loads(sample)
-        extra[0]['unknown'] = 1
+        extra[1]['options']['maxrate'] = 12345
         self.assertNotEqual(
             self.run_shell("pacing_is_default_zero_mq '" + json.dumps(extra) + "'").returncode, 0)
 

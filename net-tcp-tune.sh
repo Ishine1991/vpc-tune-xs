@@ -11548,7 +11548,7 @@ pacing_fq_args() {
           if (.value | type == "number" and . >= 0 and . == floor) then [.key,((.value|tostring)+(if .key == "timer_slack" then "ns" else "us" end))] else error("invalid time") end
         elif .key == "pacing" and (.value|type) == "boolean" then
           [if .value then "pacing" else "nopacing" end]
-        elif (.key | IN("horizon_drop","horizon_cap")) and .value == null then [.key]
+        elif (.key | IN("horizon_drop","horizon_cap")) and (.value == null or .value == true) then [.key]
         else error("unsupported FQ option: " + .key) end
       ) | flatten | .[]' <<< "$1"
 }
@@ -11556,19 +11556,20 @@ pacing_fq_args() {
 # Kernel-created mq leaves often appear as handle 0: / parent :N.
 # iproute2 may also emit metadata keys such as dev or offloaded.
 pacing_is_default_zero_mq() {
-    jq -e 'length > 1 and
+    jq -e '
       ([.[]|select(.root == true)]|length == 1) and
-      all(.[]; ((keys - ["kind","handle","parent","root","refcnt","options","dev","offloaded"])|length == 0)) and
-      all(.[]; if .root == true then .kind == "mq" and .handle == "0:" and
-          ((.options // {}) == {})
-        else .kind == "fq" and .handle == "0:" and (.parent|test("^:[0-9a-fA-F]+$"))
-          and (.options.maxrate // 4294967295) == 4294967295 end)' <<< "$1" >/dev/null
+      ([.[]|select(.root == true and .kind == "mq" and .handle == "0:" and
+        (((.options // {})|keys) - ["offloaded"]|length) == 0)]|length == 1) and
+      ([.[]|select(.parent != null)]|length) > 0 and
+      all(.[]|select(.parent != null); .kind == "fq" and .handle == "0:" and
+        (.parent|test("^:[0-9a-fA-F]+$")) and
+        (.options.maxrate // 4294967295) == 4294967295)' <<< "$1" >/dev/null
 }
 
 # Explicitly authorized migration. Backups are evidence, not a promise to restore
 # the kernel-created zero handles or packets discarded by root replacement.
 pacing_migrate_zero_mq() {
-    local iface="$1" data layout state options encoded parent minor handle backup after leaf left right failed=0
+    local iface="$1" data layout state options encoded parent minor handle backup after leaf left right filters failed=0
     local -a parents=() commands=() args=()
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     data=$(tc -j -d qdisc show dev "$iface") || return 1
@@ -11576,7 +11577,8 @@ pacing_migrate_zero_mq() {
     pacing_is_default_zero_mq "$data" || {
         pacing_error "仅迁移全部叶子为无限速 FQ 的默认零 handle mq；未修改队列。"; return 1;
     }
-    [[ $(tc -j filter show dev "$iface" root) == '[]' ]] || {
+    filters=$(tc -j filter show dev "$iface" root 2>/dev/null || echo '[]')
+    [[ "$filters" == '[]' || -z "$filters" ]] || {
         pacing_error "存在过滤器或无法检查过滤器，拒绝迁移。"; return 1;
     }
     if [[ -e "$PACING_CONFIG_FILE" ]]; then
