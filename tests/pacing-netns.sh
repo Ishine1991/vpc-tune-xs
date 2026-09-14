@@ -31,5 +31,25 @@ root=$(pacing_read_root pacingdummy)
 jq -e '.options.limit == 1234 and .options.flow_limit == 45' <<< "$root" >/dev/null
 [[ "$before_tcp" == "$(sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_congestion_control)" ]]
 [[ ! -e "$PACING_CONFIG_FILE" ]]
-echo 'PASS: actual FQ rate changes, explicit unlimited reset, queue options and TCP parameters preserved.'
+
+# Real mq + FQ leaf layout, matching multiqueue virtio network devices.
+ip link add pacingmq numtxqueues 2 type veth peer name pacingpeer numtxqueues 2
+ip link set pacingmq up
+tc qdisc replace dev pacingmq root handle 1: mq
+tc qdisc replace dev pacingmq parent 1:1 fq limit 2345 flow_limit 67
+tc qdisc replace dev pacingmq parent 1:2 fq limit 2345 flow_limit 67
+pacing_locked pacing_apply_rate pacingmq 10485760
+layout=$(pacing_read_layout pacingmq)
+[[ $(jq -r .topology <<< "$layout") == mq-fq ]]
+[[ $(jq -r '.targets | length' <<< "$layout") == 2 ]]
+jq -e 'all(.targets[]; .rate == 10485760)' <<< "$layout" >/dev/null
+pacing_locked pacing_disable
+layout=$(pacing_read_layout pacingmq)
+jq -e 'all(.targets[]; .rate == 4294967295)' <<< "$layout" >/dev/null
+leaves=$(tc -j qdisc show dev pacingmq | jq '[.[] | select(.parent != null)]')
+jq -e 'length == 2 and all(.[]; .kind == "fq" and .options.limit == 2345 and .options.flow_limit == 67)' \
+    <<< "$leaves" >/dev/null
+[[ "$before_tcp" == "$(sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_congestion_control)" ]]
+[[ ! -e "$PACING_CONFIG_FILE" ]]
+echo 'PASS: root FQ and mq+FQ leaf limits change in place, reset explicitly, and preserve TCP/qdisc parameters.'
 TEST

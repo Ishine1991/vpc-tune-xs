@@ -11490,6 +11490,147 @@ pacing_require_fq() {
     }
 }
 
+# 返回可限速的 FQ 布局：单根 FQ，或 mq 根下的全部直属 FQ 叶子。
+# mq 必须保留在根层，不能为了限速牺牲网卡的多发送队列能力。
+pacing_read_layout() {
+    local iface="$1" data root kind handle prefix children targets
+    data=$(tc -j qdisc show dev "$iface") || return 1
+    root=$(jq -ce '[.[] | select(.root == true)] |
+        if length == 1 then .[0] else error("根队列不唯一") end' <<< "$data") || return 1
+    kind=$(jq -r .kind <<< "$root")
+    case "$kind" in
+        fq)
+            pacing_require_fq "$root" || return 1
+            targets=$(jq -ce '[{parent:"root",handle:(.handle // "0:"),
+                rate:(.options.maxrate // 4294967295)}]' <<< "$root") || return 1
+            jq -cn --arg topology root-fq --argjson targets "$targets" \
+                '{topology:$topology,targets:$targets}'
+            ;;
+        mq)
+            handle=$(jq -r '.handle // "0:"' <<< "$root")
+            [[ "$handle" =~ ^[0-9a-fA-F]+:$ ]] || return 1
+            if [[ "$handle" == "0:" ]]; then prefix=":"; else prefix="$handle"; fi
+            children=$(jq -ce --arg prefix "$prefix" '[.[] |
+                select((.parent? | type) == "string") |
+                select(.parent | startswith($prefix)) |
+                select((.parent | ltrimstr($prefix)) | test("^[0-9a-fA-F]+$"))]' <<< "$data") || return 1
+            [[ $(jq -r length <<< "$children") -gt 0 ]] || {
+                pacing_error "$iface 的 mq 根队列下没有发现发送叶子队列。"; return 1;
+            }
+            jq -e 'all(.[]; .kind == "fq" and (.options | type == "object") and
+                .options.pacing != false and ((.handle // "0:") | test("^[0-9a-fA-F]+:$")))' \
+                <<< "$children" >/dev/null || {
+                pacing_error "$iface 使用 mq，但并非全部发送叶子都是启用 pacing 的 FQ；停止修改。"
+                return 1
+            }
+            targets=$(jq -ce '[.[] | {parent:.parent,handle:(.handle // "0:"),
+                rate:(.options.maxrate // 4294967295)}] | sort_by(.parent)' <<< "$children") || return 1
+            jq -cn --arg topology mq-fq --argjson targets "$targets" \
+                '{topology:$topology,targets:$targets}'
+            ;;
+        *)
+            pacing_error "$iface 当前根队列是 $kind；仅支持根 FQ 或 mq + FQ 叶子。"
+            return 1
+            ;;
+    esac
+}
+
+pacing_layout_rate() {
+    jq -er '[.targets[].rate] | unique |
+        if length == 1 then .[0] else error("各发送队列上限不一致") end' <<< "$1"
+}
+
+pacing_normalize_state() {
+    jq -ce 'if .version == 2 then
+        . + {version:3,topology:"root-fq",targets:[{parent:"root",handle:.handle}]}
+        else . end' <<< "$1"
+}
+
+pacing_same_layout() {
+    local state layout iface expected actual
+    state=$(pacing_normalize_state "$1") || return 1
+    layout="$2"
+    iface=$(jq -r .iface <<< "$state")
+    expected=$(jq -c '[.targets[] | {parent,handle}] | sort_by([.parent,.handle])' <<< "$state") || return 1
+    actual=$(jq -c '[.targets[] | {parent,handle}] | sort_by([.parent,.handle])' <<< "$layout") || return 1
+    [[ $(pacing_boot_id) == "$(jq -r .boot <<< "$state")" &&
+       $(pacing_ifindex "$iface") == "$(jq -r .ifindex <<< "$state")" &&
+       $(jq -r .topology <<< "$state") == "$(jq -r .topology <<< "$layout")" &&
+       "$expected" == "$actual" ]] || {
+        pacing_error "网卡或 FQ 队列布局已变化；停止修改，请查看实际状态。"
+        return 1
+    }
+}
+
+pacing_change_target() {
+    local iface="$1" parent="$2" handle="$3" rate="$4"
+    local -a attach handle_args=()
+    if [[ "$parent" == root ]]; then attach=(root); else attach=(parent "$parent"); fi
+    [[ "$handle" == "0:" ]] || handle_args=(handle "$handle")
+    tc qdisc change dev "$iface" "${attach[@]}" "${handle_args[@]}" fq \
+        maxrate "$((10#$rate * 8))bit"
+}
+
+pacing_layout_rates_allowed() {
+    local layout="$1" allowed="$2" current
+    local -a rates
+    mapfile -t rates < <(jq -r '.targets[].rate' <<< "$layout") || return 1
+    for current in "${rates[@]}"; do
+        case " $allowed " in *" $current "*) ;; *) return 1;; esac
+    done
+}
+
+pacing_restore_layout_snapshot() {
+    local iface="$1" expected_state="$2" snapshot="$3" current verify expected actual i failed=0
+    local -a parents handles rates
+    current=$(pacing_read_layout "$iface") || return 1
+    pacing_same_layout "$expected_state" "$current" || return 1
+    mapfile -t parents < <(jq -r '.targets[].parent' <<< "$snapshot") || return 1
+    mapfile -t handles < <(jq -r '.targets[].handle' <<< "$snapshot") || return 1
+    mapfile -t rates < <(jq -r '.targets[].rate' <<< "$snapshot") || return 1
+    for ((i=0; i<${#parents[@]}; i++)); do
+        pacing_change_target "$iface" "${parents[i]}" "${handles[i]}" "${rates[i]}" || failed=1
+    done
+    (( failed == 0 )) || return 1
+    verify=$(pacing_read_layout "$iface") || return 1
+    pacing_same_layout "$expected_state" "$verify" || return 1
+    actual=$(jq -c '[.targets[] | {parent,handle,rate}]' <<< "$verify") || return 1
+    expected=$(jq -c '[.targets[] | {parent,handle,rate}]' <<< "$snapshot") || return 1
+    [[ "$actual" == "$expected" ]]
+}
+
+pacing_set_layout_rate() {
+    local iface="$1" rate="$2" expected_state="$3" allowed_rates="$4"
+    local state layout verify parent handle i
+    local -a parents handles
+    pacing_valid_rate "$rate" || return 1
+    state=$(pacing_normalize_state "$expected_state") || return 1
+    layout=$(pacing_read_layout "$iface") || return 1
+    pacing_same_layout "$state" "$layout" || return 1
+    pacing_layout_rates_allowed "$layout" "$allowed_rates" || {
+        pacing_error "$iface 的某个 FQ 叶子上限已被其他工具修改；停止修改并保留记录。"
+        return 1
+    }
+    mapfile -t parents < <(jq -r '.targets[].parent' <<< "$state") || return 1
+    mapfile -t handles < <(jq -r '.targets[].handle' <<< "$state") || return 1
+    for ((i=0; i<${#parents[@]}; i++)); do
+        if ! pacing_change_target "$iface" "${parents[i]}" "${handles[i]}" "$rate"; then
+            pacing_error "$iface 的 FQ 队列修改未全部完成，正在恢复本次操作前的各队列上限。"
+            pacing_restore_layout_snapshot "$iface" "$state" "$layout" ||
+                pacing_error "$iface 的部分 FQ 队列未能回滚，请立即通过 [3] 核对。"
+            return 1
+        fi
+    done
+    verify=$(pacing_read_layout "$iface") || return 1
+    pacing_same_layout "$state" "$verify" || return 1
+    jq -e --argjson rate "$rate" 'all(.targets[]; .rate == $rate)' <<< "$verify" >/dev/null || {
+        pacing_error "$iface 限速读回与请求不符，正在恢复本次操作前的上限。"
+        pacing_restore_layout_snapshot "$iface" "$state" "$layout" ||
+            pacing_error "$iface 的部分 FQ 队列未能回滚，请立即通过 [3] 核对。"
+        return 1
+    }
+}
+
 pacing_write_state() {
     local data="$1" tmp
     tmp=$(mktemp "${PACING_CONFIG_FILE}.tmp.XXXXXX") || return 1
@@ -11503,14 +11644,19 @@ pacing_write_state() {
 pacing_read_state() {
     [[ -f "$PACING_CONFIG_FILE" ]] || return 1
     # 旧版 shell 配置只检测不 source，避免执行配置内容。
-    jq -ce 'select(.version == 2 and (.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and
-        (.handle | test("^[0-9a-fA-F]+:$")) and (.boot | type == "string") and
+    jq -ce 'select((.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and
+        (.boot | type == "string") and
         (.ifindex | test("^[0-9]+$")) and
         (.original == 4294967295) and
         (.rate | type == "number" and . > 0 and . < 4294967295 and . == floor) and
         ((has("previous_rate") | not) or
           (.previous_rate | type == "number" and . > 0 and . <= 4294967295 and . == floor)) and
-        (.phase == "active" or .phase == "pending"))' "$PACING_CONFIG_FILE" 2>/dev/null
+        (.phase == "active" or .phase == "pending") and
+        ((.version == 2 and (.handle | test("^[0-9a-fA-F]+:$"))) or
+         (.version == 3 and (.topology == "root-fq" or .topology == "mq-fq") and
+          (.targets | type == "array" and length > 0 and
+           all(.[]; (.parent == "root" or (.parent | test("^([0-9a-fA-F]+)?:[0-9a-fA-F]+$"))) and
+               (.handle | test("^[0-9a-fA-F]+:$")))))))' "$PACING_CONFIG_FILE" 2>/dev/null
 }
 
 pacing_write_file() {
@@ -11620,27 +11766,29 @@ pacing_set_rate() {
 
 # 每次只管理一张明确选择的接口，修改前写恢复记录，失败恢复原速率。
 pacing_apply_rate() {
-    local iface="$1" rate="$2" root before old="" original state phase boot ifindex handle
+    local iface="$1" rate="$2" layout before old="" original state phase boot ifindex topology targets
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     pacing_valid_rate "$rate" && (( rate > 0 && rate < 4294967295 )) || return 1
     [[ ! -f "$PACING_SYSCTL_FILE" ]] || {
         pacing_error "检测到旧版全局调优配置，请先选择 [5] 旧版清理。"; return 1;
     }
-    root=$(pacing_read_root "$iface") || return 1
-    pacing_require_fq "$root" || return 1
+    layout=$(pacing_read_layout "$iface") || return 1
     boot=$(pacing_boot_id) && [[ -n "$boot" ]] || return 1
     ifindex=$(pacing_ifindex "$iface") && [[ "$ifindex" =~ ^[0-9]+$ ]] || return 1
-    handle=$(jq -r .handle <<< "$root")
-    [[ "$handle" =~ ^[0-9a-fA-F]+:$ ]] || return 1
-    before=$(pacing_root_rate "$root") || return 1
+    topology=$(jq -r .topology <<< "$layout")
+    targets=$(jq -c '[.targets[] | {parent,handle}]' <<< "$layout") || return 1
+    before=$(pacing_layout_rate "$layout") || {
+        pacing_error "$iface 的各 FQ 发送队列上限不一致，请先人工核对。"; return 1;
+    }
     pacing_valid_rate "$before" || return 1
     original="$before"
     if [[ -f "$PACING_CONFIG_FILE" ]]; then
         old=$(pacing_read_state) || { pacing_error "配置为旧版或损坏，请先处理。"; return 1; }
+        old=$(pacing_normalize_state "$old") || return 1
         [[ $(jq -r .iface <<< "$old") == "$iface" ]] || {
             pacing_error "请先关闭原接口的限速。"; return 1;
         }
-        pacing_same_device "$old" "$root" || return 1
+        pacing_same_layout "$old" "$layout" || return 1
         phase=$(jq -r .phase <<< "$old")
         [[ "$phase" == active && "$before" == "$(jq -r .rate <<< "$old")" ]] || {
             pacing_error "存在未完成操作或外部修改，请先查看状态并关闭。"; return 1;
@@ -11649,19 +11797,19 @@ pacing_apply_rate() {
     elif [[ "$before" != 4294967295 ]]; then
         pacing_error "该接口已有非本功能设置的上限，请先核对或清理旧版。"; return 1
     fi
-    state=$(jq -cn --arg iface "$iface" --arg boot "$boot" \
-        --arg ifindex "$ifindex" --arg handle "$handle" \
+    state=$(jq -cn --arg iface "$iface" --arg boot "$boot" --arg topology "$topology" \
+        --arg ifindex "$ifindex" --argjson targets "$targets" \
         --argjson rate "$rate" --argjson original "$original" --argjson previous "$before" \
-        '{version:2,iface:$iface,boot:$boot,ifindex:$ifindex,handle:$handle,
+        '{version:3,iface:$iface,boot:$boot,ifindex:$ifindex,topology:$topology,targets:$targets,
           original:$original,previous_rate:$previous,rate:$rate,phase:"pending"}') || return 1
     pacing_write_state "$state" || return 1
-    if pacing_set_rate "$iface" "$rate" "$state" "$before" &&
+    if pacing_set_layout_rate "$iface" "$rate" "$state" "$before" &&
        pacing_write_state "$(jq -c '.phase="active"' <<< "$state")"; then
-        echo "已验证 $iface 每流上限: $(pacing_human_rate "$rate")"
+        echo "已验证 $iface 的 $(jq -r '.targets | length' <<< "$layout") 个 FQ 发送队列，每流上限: $(pacing_human_rate "$rate")"
         return 0
     fi
     pacing_error "应用或保存失败，尝试恢复变更前速率。"
-    if pacing_set_rate "$iface" "$before" "$state" "$before $rate"; then
+    if pacing_set_layout_rate "$iface" "$before" "$state" "$before $rate"; then
         if [[ -n "$old" ]]; then pacing_write_state "$old" || return 1
         else rm -f -- "$PACING_CONFIG_FILE" || return 1; fi
     else
@@ -11671,31 +11819,26 @@ pacing_apply_rate() {
 }
 
 pacing_disable() {
-    local state iface root original current allowed
+    local state iface layout original allowed
     [[ -f "$PACING_CONFIG_FILE" ]] || { echo "没有本版本的限速记录。"; return 0; }
     state=$(pacing_read_state) || { pacing_error "旧版配置请使用 [5] 清理。"; return 1; }
+    state=$(pacing_normalize_state "$state") || return 1
     iface=$(jq -r .iface <<< "$state")
-    root=$(pacing_read_root "$iface") || return 1
-    pacing_require_fq "$root" || return 1
-    pacing_same_device "$state" "$root" || return 1
+    layout=$(pacing_read_layout "$iface") || return 1
+    pacing_same_layout "$state" "$layout" || return 1
     original=$(jq -r .original <<< "$state")
-    current=$(pacing_root_rate "$root") || return 1
     allowed="$original $(jq -r .rate <<< "$state")"
     if [[ $(jq -r .phase <<< "$state") == pending ]]; then
         allowed="$allowed $(jq -r '.previous_rate // .original' <<< "$state")"
     fi
-    case " $allowed " in
-        *" $current "*) ;;
-        *) pacing_error "上限已被其他工具修改，保留记录，请人工核对。"; return 1;;
-    esac
-    pacing_set_rate "$iface" "$original" "$state" "$allowed" || return 1
+    pacing_set_layout_rate "$iface" "$original" "$state" "$allowed" || return 1
     rm -f -- "$PACING_CONFIG_FILE" || return 1
     echo "已验证 $iface 恢复为 $(pacing_human_rate "$original")；其他队列和 TCP 参数保持原值。"
 }
 
 # systemd 仅根据独立策略文件恢复；旧启动记录必须验证为过期后才会替换。
 pacing_restore_boot() {
-    local policy iface rate state="" root before boot ifindex handle pending
+    local policy iface rate state="" layout before boot ifindex topology targets pending
     policy=$(pacing_read_policy) || { pacing_error "开机恢复策略不存在或已损坏。"; return 1; }
     iface=$(jq -r .iface <<< "$policy")
     rate=$(jq -r .rate <<< "$policy")
@@ -11703,41 +11846,43 @@ pacing_restore_boot() {
 
     if [[ -f "$PACING_CONFIG_FILE" ]]; then
         state=$(pacing_read_state) || { pacing_error "运行记录损坏，拒绝开机恢复。"; return 1; }
+        state=$(pacing_normalize_state "$state") || return 1
         if [[ $(jq -r .boot <<< "$state") == "$boot" ]]; then
             [[ $(jq -r .iface <<< "$state") == "$iface" && $(jq -r .rate <<< "$state") == "$rate" ]] || {
                 pacing_error "本次启动已有不同的限速记录。"; return 1;
             }
-            root=$(pacing_read_root "$iface") || return 1
-            pacing_require_fq "$root" || return 1
-            pacing_same_device "$state" "$root" || return 1
-            [[ $(pacing_root_rate "$root") == "$rate" ]] || return 1
+            layout=$(pacing_read_layout "$iface") || return 1
+            pacing_same_layout "$state" "$layout" || return 1
+            [[ $(pacing_layout_rate "$layout") == "$rate" ]] || return 1
             echo "本次启动的限速已经生效。"
             return 0
         fi
         rm -f -- "$PACING_CONFIG_FILE" || return 1
     fi
 
-    root=$(pacing_read_root "$iface") || { pacing_error "网卡 $iface 尚未就绪。"; return 1; }
-    pacing_require_fq "$root" || return 1
-    before=$(pacing_root_rate "$root") || return 1
+    layout=$(pacing_read_layout "$iface") || { pacing_error "网卡 $iface 尚未就绪或 FQ 布局不受支持。"; return 1; }
+    before=$(pacing_layout_rate "$layout") || {
+        pacing_error "$iface 的各 FQ 发送队列上限不一致，拒绝自动恢复。"; return 1;
+    }
     [[ "$before" == 4294967295 || "$before" == "$rate" ]] || {
         pacing_error "$iface 已存在其他上限，拒绝覆盖。"; return 1;
     }
     ifindex=$(pacing_ifindex "$iface") && [[ "$ifindex" =~ ^[0-9]+$ ]] || return 1
-    handle=$(jq -r .handle <<< "$root")
-    [[ "$handle" =~ ^[0-9a-fA-F]+:$ ]] || return 1
+    topology=$(jq -r .topology <<< "$layout")
+    targets=$(jq -c '[.targets[] | {parent,handle}]' <<< "$layout") || return 1
     pending=$(jq -cn --arg iface "$iface" --arg boot "$boot" --arg ifindex "$ifindex" \
-        --arg handle "$handle" --argjson rate "$rate" --argjson previous "$before" \
-        '{version:2,iface:$iface,boot:$boot,ifindex:$ifindex,handle:$handle,
+        --arg topology "$topology" --argjson targets "$targets" \
+        --argjson rate "$rate" --argjson previous "$before" \
+        '{version:3,iface:$iface,boot:$boot,ifindex:$ifindex,topology:$topology,targets:$targets,
           original:4294967295,previous_rate:$previous,rate:$rate,phase:"pending"}') || return 1
     pacing_write_state "$pending" || return 1
-    if pacing_set_rate "$iface" "$rate" "$pending" "$before $rate" &&
+    if pacing_set_layout_rate "$iface" "$rate" "$pending" "$before $rate" &&
        pacing_write_state "$(jq -c '.phase="active"' <<< "$pending")"; then
         echo "已在 $iface 恢复每流上限: $(pacing_human_rate "$rate")"
         return 0
     fi
     pacing_error "开机恢复失败，尝试还原本次修改。"
-    if pacing_set_rate "$iface" "$before" "$pending" "$before $rate"; then
+    if pacing_set_layout_rate "$iface" "$before" "$pending" "$before $rate"; then
         rm -f -- "$PACING_CONFIG_FILE"
     fi
     return 1
@@ -11755,7 +11900,7 @@ pacing_enable_all() {
     pacing_input_rate || return 1
     if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_disable_all; return $?; fi
     ip -br link
-    echo "仅对所选接口现有根 FQ 设置每流上限；包含该接口上的 TCP/UDP 等出站流量。"
+    echo "对所选接口的根 FQ，或 mq 下全部 FQ 发送叶子设置每流上限；包含 TCP/UDP 等出站流量。"
     echo "不会设置 BBR、缩小缓冲区或覆盖其他队列；成功后会设置开机自动恢复。"
     read -r -p "请输入要限速的网卡（回车取消）: " iface || return 1
     [[ -n "$iface" ]] || return 1
@@ -11792,7 +11937,7 @@ pacing_disable_all() {
 }
 
 pacing_status_summary() {
-    local state iface root policy
+    local state iface layout policy actual
     if policy=$(pacing_read_policy); then
         echo "开机自动恢复: 已启用 ($(jq -r .iface <<< "$policy") / $(pacing_human_rate "$(jq -r .rate <<< "$policy")"))"
     elif [[ -f "$PACING_POLICY_FILE" ]]; then
@@ -11802,12 +11947,15 @@ pacing_status_summary() {
     fi
     echo "系统会在开机网络就绪后恢复；网卡被运行时重建时仍需重新设置。"
     if state=$(pacing_read_state); then
+        state=$(pacing_normalize_state "$state") || return 1
         iface=$(jq -r .iface <<< "$state")
         echo "保存记录: $iface / $(jq -r .phase <<< "$state") / $(pacing_human_rate "$(jq -r .rate <<< "$state")")"
-        if root=$(pacing_read_root "$iface") && pacing_require_fq "$root" && pacing_same_device "$state" "$root"; then
-            echo "内核当前上限: $(pacing_human_rate "$(pacing_root_rate "$root")")"
+        if layout=$(pacing_read_layout "$iface") && pacing_same_layout "$state" "$layout"; then
+            actual=$(pacing_layout_rate "$layout" 2>/dev/null) || actual="不一致"
+            if [[ "$actual" == "不一致" ]]; then echo "内核当前上限: 各 FQ 发送队列不一致"
+            else echo "内核当前上限: $(pacing_human_rate "$actual")"; fi
             [[ $(jq -r .phase <<< "$state") == active &&
-               $(pacing_root_rate "$root") == "$(jq -r .rate <<< "$state")" ]] || echo "记录与内核不一致或操作未完成。"
+               "$actual" == "$(jq -r .rate <<< "$state")" ]] || echo "记录与内核不一致或操作未完成。"
         else echo "记录已过期或无法读取，不能认定限速生效。"; fi
     elif [[ -f "$PACING_CONFIG_FILE" ]]; then
         echo "检测到旧版/损坏的配置；未执行其内容。"

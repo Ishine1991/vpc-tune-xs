@@ -91,7 +91,7 @@ tc() {{
             prefix = 'jq() { command jq.exe -b "$@"; }\n' + prefix
         proc = subprocess.run([BASH, '--noprofile', '--norc', '-s'],
                               input=prefix + setup + '\n' + body + '\n',
-                              capture_output=True, text=True, encoding='utf-8', timeout=20)
+                              capture_output=True, text=True, encoding='utf-8', timeout=40)
         if self.events.exists():
             self.assertNotIn('FORBIDDEN', self.events.read_text())
         return proc
@@ -103,6 +103,50 @@ tc() {{
 
     def rate(self, iface='eth0'):
         return json.loads(self.state.read_text())[iface]['options'].get('maxrate', 4294967295)
+
+    def write_kernel_mq(self, second_kind='fq'):
+        leaf_options = {'limit': 10000, 'flow_limit': 100, 'quantum': 3028}
+        self.state.write_text(json.dumps({
+            'eth0': [
+                {'kind': 'mq', 'handle': '0:', 'root': True, 'options': {}},
+                {'kind': 'fq', 'handle': '0:', 'parent': ':2',
+                 'options': dict(leaf_options)},
+                {'kind': second_kind, 'handle': '0:', 'parent': ':1',
+                 'options': dict(leaf_options)},
+            ],
+            'tun0': [{'kind': 'fq', 'handle': '8001:', 'root': True,
+                      'options': {'limit': 1234, 'flow_limit': 45, 'pacing': True}}],
+        }))
+
+    def mq_setup(self, fail_rate=None):
+        failure = '''
+        if [[ "$parent $rate" == ':2 FAIL_RATE' && ! -e "$KERNEL.failed" ]]; then
+            touch "$KERNEL.failed"; return 2
+        fi
+'''.replace('FAIL_RATE', str(fail_rate)) if fail_rate is not None else ''
+        return f'''tc() {{
+    printf '%s\\n' "$*" >> "$EVENTS"
+    if [[ "$1" == -j ]]; then
+        jq -c --arg dev "$5" '.[$dev]' "$KERNEL"
+    elif [[ "$1 $2" == 'qdisc change' ]]; then
+        local token=${{!#}} dev=$4 parent rate
+        rate=${{token%bit}}
+        if [[ "$5" == root ]]; then parent=root; else parent=$6; fi
+        {failure}
+        jq --arg dev "$dev" --arg parent "$parent" --argjson rate "$((rate / 8))" \\
+          '.[$dev] |= map(if ((.root == true and $parent == "root") or .parent == $parent)
+             then .options.maxrate=$rate else . end)' "$KERNEL" > "$KERNEL.tmp" || return 2
+        mv "$KERNEL.tmp" "$KERNEL"
+    else
+        echo 'FORBIDDEN tc command' >> "$EVENTS"; return 99
+    fi
+}}
+'''
+
+    def mq_rates(self):
+        return [item.get('options', {}).get('maxrate', 4294967295)
+                for item in json.loads(self.state.read_text())['eth0']
+                if item.get('parent')]
 
     def test_decimal_leading_zero_and_units(self):
         result = self.ok('pacing_parse_rate 08M; pacing_parse_rate 010; pacing_parse_rate 0000; pacing_parse_rate 3G')
@@ -146,6 +190,52 @@ tc() {{
         self.assertIn('qdisc change dev eth0 root fq maxrate 83886080bit', self.events.read_text())
         self.assertNotIn('handle 0:', self.events.read_text())
         self.assertEqual(json.loads(self.state.read_text())['eth0']['options']['limit'], 1234)
+
+    def test_mq_fq_leaves_apply_modify_disable_without_replacing_mq(self):
+        self.write_kernel_mq()
+        setup = self.mq_setup()
+        self.ok('pacing_apply_rate eth0 10485760; pacing_apply_rate eth0 20971520; pacing_disable', setup)
+        self.assertEqual(self.mq_rates(), [4294967295, 4294967295])
+        data = json.loads(self.state.read_text())['eth0']
+        self.assertEqual(data[0]['kind'], 'mq')
+        self.assertEqual([x['options']['quantum'] for x in data[1:]], [3028, 3028])
+        events = self.events.read_text()
+        self.assertIn('qdisc change dev eth0 parent :1 fq maxrate', events)
+        self.assertIn('qdisc change dev eth0 parent :2 fq maxrate', events)
+        self.assertNotIn('qdisc change dev eth0 root', events)
+
+    def test_mq_partial_failure_rolls_back_all_leaves(self):
+        self.write_kernel_mq()
+        proc = self.run_shell('pacing_apply_rate eth0 10485760', self.mq_setup(fail_rate=83886080))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.mq_rates(), [4294967295, 4294967295])
+        self.assertFalse(self.config.exists())
+
+    def test_mq_disable_failure_restores_pre_disable_rates(self):
+        self.write_kernel_mq()
+        self.ok('pacing_apply_rate eth0 10485760', self.mq_setup())
+        proc = self.run_shell('pacing_disable', self.mq_setup(fail_rate=34359738360))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.mq_rates(), [10485760, 10485760])
+        self.assertTrue(self.config.exists())
+
+    def test_mq_rejects_mixed_leaf_qdiscs_without_changes(self):
+        self.write_kernel_mq(second_kind='fq_codel')
+        proc = self.run_shell('pacing_apply_rate eth0 10485760', self.mq_setup())
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.mq_rates(), [4294967295, 4294967295])
+        self.assertNotIn('qdisc change', self.events.read_text())
+
+    def test_mq_boot_restore_updates_every_fq_leaf(self):
+        self.write_kernel_mq()
+        (self.base / 'policy.json').write_text(
+            json.dumps({'version': 1, 'iface': 'eth0', 'rate': 10485760}))
+        self.ok('pacing_restore_boot', self.mq_setup())
+        self.assertEqual(self.mq_rates(), [10485760, 10485760])
+        saved = json.loads(self.config.read_text())
+        self.assertEqual(saved['topology'], 'mq-fq')
+        self.assertEqual(len(saved['targets']), 2)
+        self.assertEqual(saved['phase'], 'active')
 
     def test_foreign_cap_rejected(self):
         self.write_kernel(rate=123456)
