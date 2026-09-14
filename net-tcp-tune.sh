@@ -11579,7 +11579,7 @@ pacing_migrate_zero_mq() {
     mapfile -t parents < <(jq -r '.targets[].parent' <<< "$layout")
     for parent in "${parents[@]}"; do
         minor=${parent#:}
-        (( 16#$minor > 0 && 16#$minor < 256 )) || return 1
+        (( 16#$minor > 0 && 16#$minor <= 256 )) || return 1
         options=$(jq -ce --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
         encoded=$(pacing_fq_args "$options") || { pacing_error "FQ 参数不能安全重建，未修改队列。"; return 1; }
         commands+=("$encoded")
