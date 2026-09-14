@@ -158,6 +158,14 @@ tc() {{
             'horizon', '10000000us', 'low_rate_threshold', '550000bit', 'horizon_drop'])
         result = self.ok('pacing_fq_args \'{"horizon_drop":true}\'')
         self.assertEqual(result.stdout.splitlines(), ['horizon_drop'])
+        result = self.ok('pacing_fq_args \'{"bands":3,"priomap":[1,2,2,2,1,2,0,0,1,1,1,1,1,1,1,1],"weights":[589824,196608,65536]}\'')
+        self.assertEqual(result.stdout.splitlines(), [
+            'bands', '3', 'priomap',
+            '1', '2', '2', '2', '1', '2', '0', '0',
+            '1', '1', '1', '1', '1', '1', '1', '1',
+            'weights', '589824', '196608', '65536',
+        ])
+        self.assertNotEqual(self.run_shell('pacing_fq_args \'{"bands":2}\'').returncode, 0)
 
     def test_zero_mq_requires_migration_before_writing_state(self):
         self.write_kernel_mq()
@@ -193,6 +201,19 @@ tc() {{
         extra[1]['options']['maxrate'] = 12345
         self.assertNotEqual(
             self.run_shell("pacing_is_default_zero_mq '" + json.dumps(extra) + "'").returncode, 0)
+
+    def test_newer_kernel_fq_bands_can_be_rebuilt(self):
+        options = json.dumps({
+            'limit': 10000, 'flow_limit': 100, 'buckets': 1024,
+            'orphan_mask': 1023, 'quantum': 3028, 'initial_quantum': 15140,
+            'low_rate_threshold': 68750, 'refill_delay': 40000,
+            'timer_slack': 10000, 'horizon': 10000000, 'horizon_drop': None,
+            'bands': 3,
+            'priomap': [1, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+        })
+        proc = self.ok("pacing_fq_args '" + options + "'")
+        self.assertIn('bands', proc.stdout.splitlines())
+        self.assertIn('priomap', proc.stdout.splitlines())
 
     def test_migration_rejects_unknown_or_invalid_options(self):
         for options in ('{"new_option":1}', '{"limit":"oops"}', '{"pacing":null}'):

@@ -6,7 +6,7 @@
 
 内核自动建立的根 FQ 常显示为 handle `0:`。脚本现在会直接用 `tc qdisc change` 原地修改这种现有 FQ，不再要求先手动替换队列，也不会向命令传入无效的 `handle 0:`；修改后会读回速率并确认其他 FQ 参数仍在。
 
-QEMU/virtio 等多队列网卡常见根 `mq handle 0:`、叶子 `FQ parent :1/:2`。这种零 handle 布局无法被 `tc qdisc change` 定址，直接选 39→1 会失败。请先 **39 → 7** 迁移为可定址的 `mq + FQ`，再 **39 → 1** 输入 `20M`（不是 `20`）。
+QEMU/virtio 等多队列网卡常见根 `mq handle 0:`、叶子 `FQ parent :1/:2`。这种零 handle 布局无法被 `tc qdisc change` 定址，直接选 39→1 会失败。请先 **39 → 7** 迁移为可定址的 `mq + FQ`，再 **39 → 1** 输入 `20M`（不是 `20`）。较新内核（6.7+）的 FQ 会带 `bands`/`priomap`/`weights`，迁移会原样重建，不再因这些默认优先级带报错。
 
 - Debian 依赖：`iproute2 jq util-linux`。
 - 输入 K/M/G 使用 KiB/MiB/GiB 每秒，纯数字为 KiB/s。回车取消；`0` 或子菜单 4 显式清除本功能上限并读回验证。

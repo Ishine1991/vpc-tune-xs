@@ -11547,7 +11547,21 @@ pacing_read_layout() {
 # Reject new/unknown options before replacing anything instead of silently losing them.
 pacing_fq_args() {
     jq -er '
-      to_entries | map(
+      (if has("bands") or has("priomap") then
+        if .bands == 3 and (.priomap | type == "array" and length == 16 and
+            all(.[]; type == "number" and . == floor and . >= 0 and . <= 2))
+        then ["bands","3","priomap"] + [.priomap[] | tostring]
+        else error("invalid bands/priomap") end
+      else [] end)
+      +
+      (if has("weights") then
+        if (.weights | type == "array" and length == 3 and
+            all(.[]; type == "number" and . == floor and . >= 1))
+        then ["weights"] + [.weights[] | tostring]
+        else error("invalid weights") end
+      else [] end)
+      +
+      (del(.bands, .priomap, .weights) | to_entries | map(
         if (.key | IN("limit","flow_limit","buckets","orphan_mask","quantum","initial_quantum")) then
           if (.value | type == "number" and . >= 0 and . == floor) then [.key,(.value|tostring)] else error("invalid integer") end
         elif (.key | IN("maxrate","defrate","low_rate_threshold")) then
@@ -11558,7 +11572,8 @@ pacing_fq_args() {
           [if .value then "pacing" else "nopacing" end]
         elif (.key | IN("horizon_drop","horizon_cap")) and (.value == null or .value == true) then [.key]
         else error("unsupported FQ option: " + .key) end
-      ) | flatten | .[]' <<< "$1"
+      ) | flatten)
+      | .[]' <<< "$1"
 }
 
 # Kernel-created mq leaves often appear as handle 0: / parent :N.
