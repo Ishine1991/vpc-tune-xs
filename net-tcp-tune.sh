@@ -11478,6 +11478,30 @@ pacing_input_rate() {
     fi
 }
 
+pacing_pick_iface() {
+    local line name state choice
+    local -a ifaces=() states=()
+    while IFS= read -r line; do
+        read -r name state _ <<< "$line"
+        name=${name%%@*}
+        [[ -n "$name" && "$name" != lo && "$name" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]] || continue
+        ifaces+=("$name")
+        states+=("${state:-UNKNOWN}")
+    done < <(ip -br link) || return 1
+    ((${#ifaces[@]} > 0)) || { pacing_error "没有可选择的网卡。"; return 1; }
+    echo "请选择网卡："
+    local i
+    for i in "${!ifaces[@]}"; do
+        printf '  %d. %-16s %s\n' "$((i + 1))" "${ifaces[i]}" "${states[i]}"
+    done
+    read -r -p "请输入编号（回车取消）: " choice || return 1
+    [[ -n "$choice" ]] || return 1
+    [[ "$choice" =~ ^[1-9][0-9]*$ ]] || { pacing_error "请输入有效编号。"; return 1; }
+    ((10#$choice >= 1 && 10#$choice <= ${#ifaces[@]})) || { pacing_error "编号超出范围。"; return 1; }
+    PACING_INPUT_IFACE=${ifaces[$((10#$choice - 1))]}
+    echo "已选择网卡: $PACING_INPUT_IFACE"
+}
+
 pacing_boot_id() { cat /proc/sys/kernel/random/boot_id; }
 pacing_ifindex() { cat "/sys/class/net/$1/ifindex"; }
 
@@ -11655,15 +11679,13 @@ pacing_migrate_zero_mq() {
 }
 
 pacing_migrate_menu() {
-    local iface answer
-    ip -br link
-    read -r -p "迁移网卡（回车取消）: " iface || return 1
-    [[ -n "$iface" ]] || return 1
+    local answer
+    pacing_pick_iface || return 1
     echo "将重建默认 mq + FQ 并备份参数；可能短暂丢包/中断，不能保证延迟不受影响。"
     echo "成功后允许开机恢复时对该网卡同类默认队列再次迁移；不会设置 BBR 或 TCP 缓冲区。"
     read -r -p "确认迁移？[y/N]: " answer || return 1
     [[ "$answer" =~ ^[Yy]$ ]] || return 1
-    pacing_locked pacing_migrate_zero_mq "$iface"
+    pacing_locked pacing_migrate_zero_mq "$PACING_INPUT_IFACE"
 }
 
 pacing_layout_rate() {
@@ -12062,16 +12084,13 @@ pacing_locked() (
 )
 
 pacing_enable_all() {
-    local iface
     pacing_input_rate || return 1
     if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_disable_all; return $?; fi
-    ip -br link
     echo "对所选接口的根 FQ，或 mq 下全部 FQ 发送叶子设置每流上限；包含 TCP/UDP 等出站流量。"
     echo "不会设置 BBR、缩小缓冲区或覆盖其他队列；成功后会设置开机自动恢复。"
-    read -r -p "请输入要限速的网卡（回车取消）: " iface || return 1
-    [[ -n "$iface" ]] || return 1
-    if pacing_locked pacing_apply_rate "$iface" "$PACING_INPUT_RATE"; then
-        pacing_enable_autostart "$iface" "$PACING_INPUT_RATE" || {
+    pacing_pick_iface || return 1
+    if pacing_locked pacing_apply_rate "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"; then
+        pacing_enable_autostart "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE" || {
             pacing_error "当前限速已生效，但开机自动恢复设置失败。"
             return 1
         }

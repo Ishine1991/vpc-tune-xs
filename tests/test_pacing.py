@@ -227,6 +227,23 @@ tc() {{
         self.ok("pacing_input_rate <<< '' && exit 1; exit 0")
         self.assertFalse(self.config.exists())
 
+    def test_pick_iface_by_number_skips_loopback(self):
+        setup = '''
+ip() {
+    [[ "$1 $2" == "-br link" ]] || { echo 'FORBIDDEN ip' >> "$EVENTS"; return 99; }
+    printf '%s\\n' 'lo UNKNOWN 00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>'
+    printf '%s\\n' 'eth0 UP 52:54:00:6b:c5:8c <BROADCAST,MULTICAST,UP,LOWER_UP>'
+    printf '%s\\n' 'ens5@if2 UP 06:0c:3b:62:d4:cd <BROADCAST,MULTICAST,UP,LOWER_UP>'
+}
+'''
+        proc = self.ok("pacing_pick_iface <<< 2; printf '%s\\n' \"$PACING_INPUT_IFACE\"", setup)
+        self.assertEqual(proc.stdout.splitlines()[-1], 'ens5')
+        self.assertIn('1. eth0', proc.stdout)
+        self.assertIn('2. ens5', proc.stdout)
+        self.assertNotIn(' lo', proc.stdout)
+        self.assertNotEqual(self.run_shell('pacing_pick_iface <<< 9', setup).returncode, 0)
+        self.assertNotEqual(self.run_shell("pacing_pick_iface <<< ''", setup).returncode, 0)
+
     def test_bare_number_requires_confirmation(self):
         proc = self.run_shell("pacing_input_rate <<< $'20\\nn' && exit 1; exit 0")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
