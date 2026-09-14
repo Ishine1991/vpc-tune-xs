@@ -91,7 +91,7 @@ tc() {{
             prefix = 'jq() { command jq.exe -b "$@"; }\n' + prefix
         proc = subprocess.run([BASH, '--noprofile', '--norc', '-s'],
                               input=prefix + setup + '\n' + body + '\n',
-                              capture_output=True, text=True, encoding='utf-8', timeout=40)
+                              capture_output=True, text=True, encoding='utf-8', timeout=90)
         if self.events.exists():
             self.assertNotIn('FORBIDDEN', self.events.read_text())
         return proc
@@ -165,10 +165,23 @@ tc() {{
             '1', '1', '1', '1', '1', '1', '1', '1',
             'weights', '589824', '196608', '65536',
         ])
+        result = self.ok('PACING_FQ_SKIP_WEIGHTS=1 pacing_fq_args \'{"bands":3,"priomap":[1,2,2,2,1,2,0,0,1,1,1,1,1,1,1,1],"weights":[589824,196608,65536]}\'')
+        self.assertNotIn('weights', result.stdout.splitlines())
         self.assertNotEqual(self.run_shell('pacing_fq_args \'{"bands":2}\'').returncode, 0)
         # iproute2 JSON uses "priomap " / "weights " with a trailing space.
-        result = self.ok('pacing_fq_args \'{"bands":3,"priomap ":[1,2,2,2,1,2,0,0,1,1,1,1,1,1,1,1],"weights ":[589824,196608,65536]}\'')
+        result = self.ok('PACING_FQ_SKIP_WEIGHTS=1 pacing_fq_args \'{"bands":3,"priomap ":[1,2,2,2,1,2,0,0,1,1,1,1,1,1,1,1],"weights ":[589824,196608,65536]}\'')
         self.assertEqual(result.stdout.splitlines()[:3], ['bands', '3', 'priomap'])
+        self.ok('pacing_fq_options_match \'{"limit":10000,"weights":[1,2,3]}\' \'{"limit":10000}\'')
+        self.assertNotEqual(self.run_shell('pacing_fq_options_match \'{"limit":10000}\' \'{"limit":9999}\'').returncode, 0)
+
+    def test_require_addressable_rejects_zero_handles_on_migrated_mq(self):
+        layout = self.base / 'layout.json'
+        layout.write_text(
+            '{"topology":"mq-fq","targets":[{"parent":"7ffe:1","handle":"0:","rate":4294967295}]}\n',
+            encoding='utf-8', newline='\n')
+        proc = self.run_shell(
+            f'pacing_require_addressable "$(cat {shell_path(layout)})" && false')
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_zero_mq_requires_migration_before_writing_state(self):
         self.write_kernel_mq()

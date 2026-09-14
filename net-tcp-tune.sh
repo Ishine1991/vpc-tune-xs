@@ -11569,8 +11569,13 @@ pacing_read_layout() {
 
 # Serialize only FQ options whose units and round-trip representation are known.
 # Reject new/unknown options before replacing anything instead of silently losing them.
+# Migration skips weights: some iproute2 builds reject kernel-reported weights on replace.
 pacing_fq_args() {
-    jq -er '
+    jq -er --arg skip_weights "${PACING_FQ_SKIP_WEIGHTS:-0}" '
+      def intish:
+        if type == "number" then floor
+        elif type == "string" then (tonumber | floor)
+        else error("invalid integer") end;
       with_entries(.key |= gsub("^\\s+|\\s+$";"")) |
       (if has("bands") or has("priomap") then
         if .bands == 3 and (.priomap | type == "array" and length == 16 and
@@ -11580,7 +11585,7 @@ pacing_fq_args() {
         else error("invalid bands/priomap") end
       else [] end)
       +
-      (if has("weights") then
+      (if $skip_weights != "1" and has("weights") then
         if (.weights | type == "array" and length == 3 and
             all(.[]; ((type == "number" and . == floor) or type == "string")
               and (tonumber >= 1)))
@@ -11590,7 +11595,7 @@ pacing_fq_args() {
       +
       (del(.bands, .priomap, .weights) | to_entries | map(
         if (.key | IN("limit","flow_limit","buckets","orphan_mask","quantum","initial_quantum")) then
-          if (.value | type == "number" and . >= 0 and . == floor) then [.key,(.value|tostring)] else error("invalid integer") end
+          if ((.value | intish) >= 0) then [.key,((.value|intish)|tostring)] else error("invalid integer") end
         elif (.key | IN("maxrate","defrate","low_rate_threshold")) then
           if (.value | type == "number" and . >= 0 and . == floor) then [.key,((.value*8|tostring)+"bit")] else error("invalid rate") end
         elif (.key | IN("refill_delay","ce_threshold","horizon","offload_horizon","timer_slack")) then
@@ -11616,6 +11621,63 @@ pacing_is_default_zero_mq() {
         (.options.maxrate // 4294967295) == 4294967295)' <<< "$1" >/dev/null
 }
 
+pacing_fq_options_match() {
+    jq -e --argjson expected "$2" '
+      def norm:
+        with_entries(.key |= gsub("^\\s+|\\s+$";"")) |
+        del(.weights, .maxrate);
+      norm | contains($expected | norm)' <<< "$1" >/dev/null
+}
+
+# Finish a partial migration: root mq is already 7ffe:, but leaves still use handle 0:.
+pacing_migrate_mq_leaves() {
+    local iface="$1" data="$2" backup after failed=0
+    local -a parents=() commands=() args=()
+    local parent minor handle options encoded
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
+    jq -e 'any(.[]; .root == true and .kind == "mq" and .handle == "7ffe:") and
+      ([.[]|select(.parent != null)]|length > 0) and
+      all(.[]|select(.parent != null); .kind == "fq" and .handle == "0:" and
+        (.parent|test("^7ffe:[0-9a-fA-F]+$")))' <<< "$data" >/dev/null || {
+        pacing_error "当前不是可修复的未完成迁移布局。"; return 1;
+    }
+    mapfile -t parents < <(jq -r '[.[]|select(.parent != null)|.parent]|sort[]' <<< "$data")
+    for parent in "${parents[@]}"; do
+        minor=${parent#7ffe:}
+        (( 16#$minor > 0 && 16#$minor <= 256 )) || return 1
+        options=$(jq -ce --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
+        PACING_FQ_SKIP_WEIGHTS=1
+        encoded=$(pacing_fq_args "$options") || { pacing_error "FQ 参数不能安全重建，未修改队列。"; return 1; }
+        commands+=("$encoded")
+    done
+    backup="${PACING_CONFIG_FILE}.migration-${iface}-$(date +%s)-$$"
+    pacing_write_file "$backup" 600 "$data" || return 1
+    echo "未完成迁移的队列参数已保存到 $backup"
+    for ((minor=0; minor<${#parents[@]}; minor++)); do
+        parent=${parents[minor]#7ffe:}
+        printf -v handle '%x:' "$((0x7000 + 16#$parent))"
+        mapfile -t args < <(printf '%s\n' "${commands[minor]}" | sed '/^$/d')
+        tc qdisc replace dev "$iface" parent "7ffe:$parent" handle "$handle" fq "${args[@]}" || failed=1
+    done
+    after=$(tc -j -d qdisc show dev "$iface") || failed=1
+    for parent in "${parents[@]}"; do
+        options=$(jq -c --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
+        minor=${parent#7ffe:}
+        printf -v handle '%x:' "$((0x7000 + 16#$minor))"
+        leaf=$(jq -ce --arg parent "$parent" --arg handle "$handle" \
+            '.[]|select(.parent == $parent and .kind == "fq" and .handle == $handle)|.options' <<< "$after") \
+            || { failed=1; continue; }
+        pacing_fq_options_match "$leaf" "$options" || failed=1
+    done
+    if (( failed )); then
+        pacing_error "迁移修复未完整验证。已保留参数 $backup；请用 [3] 检查。"
+        return 1
+    fi
+    pacing_write_file "${PACING_CONFIG_FILE}.migrate-${iface}" 600 "$iface" || return 1
+    echo "已修复 FQ 叶子为非零 handle；现在可选择 [1] 限速。"
+    return 0
+}
+
 # Explicitly authorized migration. Backups are evidence, not a promise to restore
 # the kernel-created zero handles or packets discarded by root replacement.
 pacing_migrate_zero_mq() {
@@ -11623,6 +11685,11 @@ pacing_migrate_zero_mq() {
     local -a parents=() commands=() args=()
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     data=$(tc -j -d qdisc show dev "$iface") || return 1
+    if jq -e 'any(.[]; .root == true and .kind == "mq" and .handle == "7ffe:") and
+        all(.[]|select(.parent != null); .kind == "fq" and .handle == "0:")' <<< "$data" >/dev/null; then
+        pacing_migrate_mq_leaves "$iface" "$data"
+        return $?
+    fi
     layout=$(pacing_read_layout "$iface") || return 1
     pacing_is_default_zero_mq "$data" || {
         pacing_error "仅迁移全部叶子为无限速 FQ 的默认零 handle mq；未修改队列。"; return 1;
@@ -11641,6 +11708,7 @@ pacing_migrate_zero_mq() {
         minor=${parent#:}
         (( 16#$minor > 0 && 16#$minor <= 256 )) || return 1
         options=$(jq -ce --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
+        PACING_FQ_SKIP_WEIGHTS=1
         encoded=$(pacing_fq_args "$options") || { pacing_error "FQ 参数不能安全重建，未修改队列。"; return 1; }
         commands+=("$encoded")
     done
@@ -11659,7 +11727,7 @@ pacing_migrate_zero_mq() {
     for ((minor=0; minor<${#parents[@]}; minor++)); do
         parent=${parents[minor]#:}
         printf -v handle '%x:' "$((0x7000 + 16#$parent))"
-        mapfile -t args <<< "${commands[minor]}"
+        mapfile -t args < <(printf '%s\n' "${commands[minor]}" | sed '/^$/d')
         tc qdisc replace dev "$iface" parent "7ffe:$parent" handle "$handle" fq "${args[@]}" || failed=1
     done
     after=$(tc -j -d qdisc show dev "$iface") || failed=1
@@ -11668,11 +11736,16 @@ pacing_migrate_zero_mq() {
       ([.[]|select(.parent != null)]|length == $count)' <<< "$after" >/dev/null || failed=1
     for parent in "${parents[@]}"; do
         options=$(jq -c --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
-        leaf=$(jq -ce --arg parent "7ffe:${parent#:}" '.[]|select(.parent == $parent and .kind == "fq")|.options' <<< "$after") || { failed=1; continue; }
-        jq -e --argjson expected "$options" 'contains($expected)' <<< "$leaf" >/dev/null || failed=1
+        minor=${parent#:}
+        printf -v handle '%x:' "$((0x7000 + 16#$minor))"
+        leaf=$(jq -ce --arg parent "7ffe:$minor" --arg handle "$handle" \
+            '.[]|select(.parent == $parent and .kind == "fq" and .handle == $handle)|.options' <<< "$after") \
+            || { failed=1; continue; }
+        pacing_fq_options_match "$leaf" "$options" || failed=1
     done
     if (( failed )); then
-        pacing_error "迁移未完整验证。已保留原始参数 $backup；不要继续限速，请用 [3] 检查。"
+        tc qdisc del dev "$iface" root 2>/dev/null || true
+        pacing_error "迁移未完整验证，已尝试删除损坏的根队列。原始参数 $backup；请用 [3] 检查，必要时重启网卡或 VPS。"
         return 1
     fi
     [[ ! -e "$PACING_CONFIG_FILE" ]] || mv -- "$PACING_CONFIG_FILE" "${backup}.pending" || return 1
@@ -11697,8 +11770,13 @@ pacing_layout_rate() {
 }
 
 pacing_require_addressable() {
-    if jq -e '.topology == "mq-fq" and any(.targets[]; .parent|startswith(":"))' <<< "$1" >/dev/null; then
-        pacing_error "默认 mq 的零 handle 无法定址修改；请先选择 [7] 迁移，再选择 [1]。"
+    if jq -e '
+      .topology == "mq-fq" and
+      any(.targets[]?; type == "object" and
+        ((.parent // "" | startswith(":")) or
+         ((.parent // "" | startswith("7ffe:")) and ((.handle // "") == "0:"))))' \
+        <<< "$1" >/dev/null; then
+        pacing_error "FQ 叶子仍为不可定址的零 handle；请先选择 [7] 完成迁移，再选择 [1]。"
         return 1
     fi
 }
@@ -11729,6 +11807,12 @@ pacing_change_target() {
     local iface="$1" parent="$2" handle="$3" rate="$4"
     local -a attach handle_args=()
     if [[ "$parent" == root ]]; then attach=(root); else attach=(parent "$parent"); fi
+    if [[ "$handle" == "0:" && "$parent" != root ]]; then
+        [[ "$parent" =~ ^7ffe:[0-9a-fA-F]+$ ]] && {
+            pacing_error "FQ 叶子仍为不可定址的零 handle；请先选择 [7] 完成迁移。"
+            return 1
+        }
+    fi
     [[ "$handle" == "0:" ]] || handle_args=(handle "$handle")
     tc qdisc change dev "$iface" "${attach[@]}" "${handle_args[@]}" fq \
         maxrate "$((10#$rate * 8))bit"

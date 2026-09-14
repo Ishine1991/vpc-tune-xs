@@ -6,7 +6,7 @@
 
 内核自动建立的根 FQ 常显示为 handle `0:`。脚本现在会直接用 `tc qdisc change` 原地修改这种现有 FQ，不再要求先手动替换队列，也不会向命令传入无效的 `handle 0:`；修改后会读回速率并确认其他 FQ 参数仍在。
 
-QEMU/virtio 等多队列网卡常见根 `mq handle 0:`、叶子 `FQ parent :1/:2`。这种零 handle 布局无法被 `tc qdisc change` 定址，直接选 39→1 会失败。请先 **39 → 7** 按编号选择网卡并迁移，再 **39 → 1** 输入 `20M`（不是 `20`），同样按编号选网卡。较新内核（6.7+）的 FQ 会带 `bands`/`priomap`/`weights`；`tc -j` 有时把键名打成带空格的 `priomap `，迁移会识别并原样重建。
+QEMU/virtio 等多队列网卡常见根 `mq handle 0:`、叶子 `FQ parent :1/:2`。这种零 handle 布局无法被 `tc qdisc change` 定址，直接选 39→1 会失败。请先 **39 → 7** 按编号选择网卡并迁移，再 **39 → 1** 输入 `20M`（不是 `20`），同样按编号选网卡。较新内核（6.7+）的 FQ 会带 `bands`/`priomap`/`weights`；`tc -j` 有时把键名打成带空格的 `priomap `，迁移会识别并原样重建。迁移时不回写 `weights`（部分 iproute2 会拒绝），限速不受影响。若选项 7 中断后根队列已是 `7ffe:` 但叶子仍是 `handle 0:`，再次选 **7** 会自动修复；失败时会尝试删除损坏的根队列。
 
 - Debian 依赖：`iproute2 jq util-linux`。
 - 输入 K/M/G 使用 KiB/MiB/GiB 每秒，纯数字为 KiB/s。回车取消；`0` 或子菜单 4 显式清除本功能上限并读回验证。
