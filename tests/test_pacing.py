@@ -134,15 +134,18 @@ tc() {{
                 self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760').returncode, 0)
                 self.assertFalse(self.config.exists())
 
-    def test_default_handle_zero_rejected_without_replacement(self):
+    def test_default_handle_zero_is_changed_in_place_without_replacement(self):
         self.write_kernel()
         data = json.loads(self.state.read_text())
         data['eth0']['handle'] = '0:'
         self.state.write_text(json.dumps(data))
         proc = self.run_shell('pacing_apply_rate eth0 10485760')
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertFalse(self.config.exists())
-        self.assertNotIn('qdisc change', self.events.read_text())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.rate(), 10485760)
+        self.assertTrue(self.config.exists())
+        self.assertIn('qdisc change dev eth0 root fq maxrate 83886080bit', self.events.read_text())
+        self.assertNotIn('handle 0:', self.events.read_text())
+        self.assertEqual(json.loads(self.state.read_text())['eth0']['options']['limit'], 1234)
 
     def test_foreign_cap_rejected(self):
         self.write_kernel(rate=123456)

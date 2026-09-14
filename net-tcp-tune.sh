@@ -11632,9 +11632,6 @@ pacing_apply_rate() {
     ifindex=$(pacing_ifindex "$iface") && [[ "$ifindex" =~ ^[0-9]+$ ]] || return 1
     handle=$(jq -r .handle <<< "$root")
     [[ "$handle" =~ ^[0-9a-fA-F]+:$ ]] || return 1
-    [[ "$handle" != "0:" ]] || {
-        pacing_error "这是内核默认根 FQ（handle 0）；不会隐式替换它。请先手动建立带非零 handle 的根 FQ 后重试。"; return 1;
-    }
     before=$(pacing_root_rate "$root") || return 1
     pacing_valid_rate "$before" || return 1
     original="$before"
