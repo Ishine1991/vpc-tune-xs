@@ -166,6 +166,9 @@ tc() {{
             'weights', '589824', '196608', '65536',
         ])
         self.assertNotEqual(self.run_shell('pacing_fq_args \'{"bands":2}\'').returncode, 0)
+        # iproute2 JSON uses "priomap " / "weights " with a trailing space.
+        result = self.ok('pacing_fq_args \'{"bands":3,"priomap ":[1,2,2,2,1,2,0,0,1,1,1,1,1,1,1,1],"weights ":[589824,196608,65536]}\'')
+        self.assertEqual(result.stdout.splitlines()[:3], ['bands', '3', 'priomap'])
 
     def test_zero_mq_requires_migration_before_writing_state(self):
         self.write_kernel_mq()

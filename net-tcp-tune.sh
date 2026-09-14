@@ -11571,16 +11571,19 @@ pacing_read_layout() {
 # Reject new/unknown options before replacing anything instead of silently losing them.
 pacing_fq_args() {
     jq -er '
+      with_entries(.key |= gsub("^\\s+|\\s+$";"")) |
       (if has("bands") or has("priomap") then
         if .bands == 3 and (.priomap | type == "array" and length == 16 and
-            all(.[]; type == "number" and . == floor and . >= 0 and . <= 2))
+            all(.[]; ((type == "number" and . == floor) or type == "string")
+              and (tonumber >= 0 and tonumber <= 2)))
         then ["bands","3","priomap"] + [.priomap[] | tostring]
         else error("invalid bands/priomap") end
       else [] end)
       +
       (if has("weights") then
         if (.weights | type == "array" and length == 3 and
-            all(.[]; type == "number" and . == floor and . >= 1))
+            all(.[]; ((type == "number" and . == floor) or type == "string")
+              and (tonumber >= 1)))
         then ["weights"] + [.weights[] | tostring]
         else error("invalid weights") end
       else [] end)
