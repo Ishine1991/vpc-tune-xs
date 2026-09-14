@@ -206,6 +206,13 @@ tc() {{
         self.ok("pacing_input_rate <<< '' && exit 1; exit 0")
         self.assertFalse(self.config.exists())
 
+    def test_bare_number_requires_confirmation(self):
+        proc = self.run_shell("pacing_input_rate <<< $'20\\nn' && exit 1; exit 0")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn('0.02 MiB/s', proc.stdout + proc.stderr)
+        proc = self.ok("pacing_input_rate <<< $'20\\ny'; printf '%s\\n' \"$PACING_INPUT_RATE\"")
+        self.assertEqual(proc.stdout.splitlines()[-1], '20480')
+
     def test_apply_modify_disable_preserves_queue_and_other_iface(self):
         self.ok('pacing_apply_rate eth0 10485760; pacing_apply_rate eth0 20971520; pacing_disable')
         self.assertEqual(self.rate(), 4294967295)
@@ -361,6 +368,21 @@ pacing_write_state() { saves=$((saves+1)); [[ $saves != 2 ]] || return 1; origin
         self.ok('pacing_disable_autostart', setup)
         self.assertFalse((self.base / 'policy.json').exists())
         self.assertFalse((self.base / 'pacing.service').exists())
+
+    def test_autostart_downloads_when_not_a_regular_file(self):
+        setup = '''
+systemctl() { printf '%s\n' "$*" >> "$EVENTS"; }
+PACING_SCRIPT_SOURCE=/dev/fd/63
+curl() {
+    printf '%s\\n' "$*" >> "$EVENTS"
+    local out=${!#}
+    printf 'pacing_restore_boot\\n' > "$out"
+}
+'''
+        self.ok('pacing_enable_autostart eth0 10485760', setup)
+        self.assertTrue((self.base / 'installed/net-tcp-tune.sh').exists())
+        self.assertIn('pacing_restore_boot', (self.base / 'installed/net-tcp-tune.sh').read_text())
+        self.assertIn('raw.githubusercontent.com', self.events.read_text())
 
     def test_legacy_not_executed_and_blocks_enable(self):
         self.config.write_text('echo CONFIG_EXECUTED\n')

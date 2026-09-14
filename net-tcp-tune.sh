@@ -11382,6 +11382,7 @@ PACING_LOCK_FILE="/run/net-tcp-tune-pacing.lock"
 PACING_POLICY_FILE="/etc/net-tcp-tune-pacing-policy.json"
 PACING_SERVICE_FILE="/etc/systemd/system/net-tcp-tune-pacing.service"
 PACING_INSTALLED_SCRIPT="/usr/local/lib/net-tcp-tune/net-tcp-tune.sh"
+PACING_PUBLISHED_SCRIPT_URL="https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh"
 
 pacing_error() { echo "错误: $*" >&2; }
 
@@ -11461,13 +11462,20 @@ pacing_human_rate() {
 }
 
 pacing_input_rate() {
-    local input
+    local input confirm
     echo "单位 K/M/G = KiB/MiB/GiB 每秒；纯数字为 KiB/s。0 = 关闭本功能。"
-    read -r -p "每流上限（例如 10M；回车取消）: " input || return 1
+    echo "例如 20M = 20 MiB/s；只输入 20 = 20 KiB/s。"
+    read -r -p "每流上限（例如 20M；回车取消）: " input || return 1
     [[ -n "$input" ]] || return 1
     PACING_INPUT_RATE=$(pacing_parse_rate "$input") || {
         pacing_error "请输入有效整数速率，且小于 4 GiB/s。"; return 1;
     }
+    if (( PACING_INPUT_RATE > 0 && PACING_INPUT_RATE < 1048576 )) && [[ ! "$input" =~ [KkMmGg]$ ]]; then
+        echo "注意: 输入 $input 将设置为 $(pacing_human_rate "$PACING_INPUT_RATE")"
+        echo "若要约 ${input} MiB/s，请取消后改输入 ${input}M。"
+        read -r -p "确认使用该速率？[y/N]: " confirm || return 1
+        [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+    fi
 }
 
 pacing_boot_id() { cat /proc/sys/kernel/random/boot_id; }
@@ -11794,17 +11802,36 @@ pacing_read_policy() {
         . < 4294967295 and . == floor))' "$PACING_POLICY_FILE" 2>/dev/null
 }
 
+pacing_install_running_script() {
+    local dest="$1" source="${PACING_SCRIPT_SOURCE:-${BASH_SOURCE[0]}}" tmp
+    tmp="${dest}.tmp"
+    mkdir -p -- "${dest%/*}" || return 1
+    if [[ -f "$source" && -r "$source" ]]; then
+        install -m 700 -- "$source" "$tmp" || return 1
+    elif command -v curl >/dev/null; then
+        echo "当前为在线运行，正在下载脚本副本以安装开机恢复..."
+        curl -fsSL "${PACING_PUBLISHED_SCRIPT_URL}?$(date +%s)" -o "$tmp" || {
+            pacing_error "无法下载开机恢复脚本。"; rm -f -- "$tmp"; return 1
+        }
+        chmod 700 "$tmp" || { rm -f -- "$tmp"; return 1; }
+        grep -q 'pacing_restore_boot' "$tmp" || {
+            pacing_error "下载的脚本不完整，未安装开机恢复。"
+            rm -f -- "$tmp"
+            return 1
+        }
+    else
+        pacing_error "请先下载脚本为普通文件再运行，才能安装开机恢复。"
+        return 1
+    fi
+    mv -f -- "$tmp" "$dest"
+}
+
 pacing_enable_autostart() {
-    local iface="$1" rate="$2" source policy unit dir
+    local iface="$1" rate="$2" policy unit
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     pacing_valid_rate "$rate" && ((rate > 0 && rate < 4294967295)) || return 1
     command -v systemctl >/dev/null || { pacing_error "未找到 systemctl，无法设置开机恢复。"; return 1; }
-    source="${BASH_SOURCE[0]}"
-    [[ -f "$source" && -r "$source" ]] || { pacing_error "请先下载脚本为普通文件再运行，才能安装开机恢复。"; return 1; }
-    dir=${PACING_INSTALLED_SCRIPT%/*}
-    mkdir -p -- "$dir" || return 1
-    install -m 700 -- "$source" "${PACING_INSTALLED_SCRIPT}.tmp" || return 1
-    mv -f -- "${PACING_INSTALLED_SCRIPT}.tmp" "$PACING_INSTALLED_SCRIPT" || return 1
+    pacing_install_running_script "$PACING_INSTALLED_SCRIPT" || return 1
     unit='[Unit]
 Description=Restore net-tcp-tune FQ per-flow rate limit
 Wants=network-online.target

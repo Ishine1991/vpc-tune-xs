@@ -228,11 +228,7 @@ FQ 叶子的 parent 为 `:1`、`:2`，先进入 **39 → 7**，输入网卡并�
 纯数字 `20` 表示 **20 KiB/s**；`20M` 表示 **20 MiB/s**，不是 20 Mbit/s。
 该功能作用于网卡的出站 FQ 流（包括 UDP），不是整张网卡总带宽上限。
 
-需要开机恢复时，请下载为普通文件运行，不要使用 `bash <(curl ...)`：
-
-```bash
-script=$(mktemp /tmp/net-tcp-tune.XXXXXX.sh) && curl -fsSL "https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh?$(date +%s)" -o "$script" && bash "$script"
-```
+`bash <(curl ...)` 现在也可以安装开机恢复：会再下载一份脚本副本到 `/usr/local/lib/net-tcp-tune/`。纯数字 `20` 会二次确认，避免误设成 20 KiB/s。
 
 **Q: 安装后运行 `bbr` 提示找不到命令？**
 A: 请执行 `source ~/.bashrc` 重新加载配置，或者断开 SSH 重连即可。
