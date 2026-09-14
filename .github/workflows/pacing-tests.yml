@@ -8,7 +8,7 @@ on:
       - .gitattributes
       - .github/workflows/pacing-tests.yml
   push:
-    branches: [main, fix/option39-pacing-recovery]
+    branches: [main, fix/option39-pacing-recovery, fix/option39-zero-handle]
     paths:
       - '**/*.sh'
       - tests/**
@@ -46,4 +46,8 @@ jobs:
       - name: Run isolated control-flow tests
         run: python3 -B -m unittest discover -s tests -v
       - name: Verify real FQ in an isolated network namespace
-        run: sudo bash tests/pacing-netns.sh
+        run: |
+          old=$(sysctl -n net.core.default_qdisc)
+          trap 'sudo sysctl -w net.core.default_qdisc="$old"' EXIT
+          sudo sysctl -w net.core.default_qdisc=fq
+          sudo env PACING_TEST_DEFAULT_FQ=1 bash tests/pacing-netns.sh

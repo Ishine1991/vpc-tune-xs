@@ -108,10 +108,10 @@ tc() {{
         leaf_options = {'limit': 10000, 'flow_limit': 100, 'quantum': 3028}
         self.state.write_text(json.dumps({
             'eth0': [
-                {'kind': 'mq', 'handle': '0:', 'root': True, 'options': {}},
-                {'kind': 'fq', 'handle': '0:', 'parent': ':2',
+                {'kind': 'mq', 'handle': '1:', 'root': True, 'options': {}},
+                {'kind': 'fq', 'handle': '0:', 'parent': '1:2',
                  'options': dict(leaf_options)},
-                {'kind': second_kind, 'handle': '0:', 'parent': ':1',
+                {'kind': second_kind, 'handle': '0:', 'parent': '1:1',
                  'options': dict(leaf_options)},
             ],
             'tun0': [{'kind': 'fq', 'handle': '8001:', 'root': True,
@@ -120,7 +120,7 @@ tc() {{
 
     def mq_setup(self, fail_rate=None):
         failure = '''
-        if [[ "$parent $rate" == ':2 FAIL_RATE' && ! -e "$KERNEL.failed" ]]; then
+        if [[ "$parent $rate" == '1:2 FAIL_RATE' && ! -e "$KERNEL.failed" ]]; then
             touch "$KERNEL.failed"; return 2
         fi
 '''.replace('FAIL_RATE', str(fail_rate)) if fail_rate is not None else ''
@@ -151,6 +151,16 @@ tc() {{
     def test_decimal_leading_zero_and_units(self):
         result = self.ok('pacing_parse_rate 08M; pacing_parse_rate 010; pacing_parse_rate 0000; pacing_parse_rate 3G')
         self.assertEqual(result.stdout.splitlines(), ['8388608', '10240', '0', '3221225472'])
+
+    def test_migration_option_units(self):
+        result = self.ok('pacing_fq_args \'{"limit":10000,"timer_slack":10000,"horizon":10000000,"low_rate_threshold":68750,"horizon_drop":null}\'')
+        self.assertEqual(result.stdout.splitlines(), ['limit', '10000', 'timer_slack', '10000ns',
+            'horizon', '10000000us', 'low_rate_threshold', '550000bit', 'horizon_drop'])
+
+    def test_migration_rejects_unknown_or_invalid_options(self):
+        for options in ('{"new_option":1}', '{"limit":"oops"}', '{"pacing":null}'):
+            with self.subTest(options=options):
+                self.assertNotEqual(self.run_shell("pacing_fq_args '" + options + "'").returncode, 0)
 
     def test_reject_invalid_overflow_and_sentinel(self):
         self.ok('for r in 4G 9223372036854775807G -1 1.5M abc; do pacing_parse_rate "$r" && exit 1; done; exit 0')
@@ -200,8 +210,8 @@ tc() {{
         self.assertEqual(data[0]['kind'], 'mq')
         self.assertEqual([x['options']['quantum'] for x in data[1:]], [3028, 3028])
         events = self.events.read_text()
-        self.assertIn('qdisc change dev eth0 parent :1 fq maxrate', events)
-        self.assertIn('qdisc change dev eth0 parent :2 fq maxrate', events)
+        self.assertIn('qdisc change dev eth0 parent 1:1 fq maxrate', events)
+        self.assertIn('qdisc change dev eth0 parent 1:2 fq maxrate', events)
         self.assertNotIn('qdisc change dev eth0 root', events)
 
     def test_mq_partial_failure_rolls_back_all_leaves(self):

@@ -32,7 +32,32 @@ jq -e '.options.limit == 1234 and .options.flow_limit == 45' <<< "$root" >/dev/n
 [[ "$before_tcp" == "$(sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_congestion_control)" ]]
 [[ ! -e "$PACING_CONFIG_FILE" ]]
 
-# Real mq + FQ leaf layout, matching multiqueue virtio network devices.
+# CI sets default_qdisc=fq on its disposable runner, not on a production host.
+# A nonzero txqueuelen makes veth activate its automatic multiqueue qdisc.
+if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
+    ip link add pacingzero numtxqueues 2 type veth peer name pacingzerop numtxqueues 2
+    ip link set pacingzero txqueuelen 1000
+    ip link set pacingzero up
+    zero=$(tc -j -d qdisc show dev pacingzero)
+    echo "Automatic kernel layout: $zero"
+    jq -e 'any(.[]; .kind == "mq" and .root == true and .handle == "0:") and
+      ([.[]|select(.kind == "fq" and .handle == "0:")]|length == 2)' <<< "$zero" >/dev/null
+    pacing_locked pacing_migrate_zero_mq pacingzero
+    pacing_locked pacing_apply_rate pacingzero 20480
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingzero)") == 20480 ]]
+    pacing_locked pacing_apply_rate pacingzero 20971520
+    pacing_locked pacing_disable
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingzero)") == 4294967295 ]]
+    # Simulate fresh automatic qdiscs at next boot and exercise authorized restore.
+    tc qdisc del dev pacingzero root
+    PACING_POLICY_FILE="$work/policy.json"
+    printf '%s\n' '{"version":1,"iface":"pacingzero","rate":20480}' > "$PACING_POLICY_FILE"
+    pacing_locked pacing_restore_boot
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingzero)") == 20480 ]]
+    pacing_locked pacing_disable
+fi
+
+# Explicit nonzero mq + FQ leaf layout.
 ip link add pacingmq numtxqueues 2 type veth peer name pacingpeer numtxqueues 2
 ip link set pacingmq up
 tc qdisc replace dev pacingmq root handle 1: mq

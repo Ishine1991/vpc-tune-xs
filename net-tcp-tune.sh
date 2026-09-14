@@ -11535,9 +11535,105 @@ pacing_read_layout() {
     esac
 }
 
+# Serialize only FQ options whose units and round-trip representation are known.
+# Reject new/unknown options before replacing anything instead of silently losing them.
+pacing_fq_args() {
+    jq -er '
+      to_entries | map(
+        if (.key | IN("limit","flow_limit","buckets","orphan_mask","quantum","initial_quantum")) then
+          if (.value | type == "number" and . >= 0 and . == floor) then [.key,(.value|tostring)] else error("invalid integer") end
+        elif (.key | IN("maxrate","defrate","low_rate_threshold")) then
+          if (.value | type == "number" and . >= 0 and . == floor) then [.key,((.value*8|tostring)+"bit")] else error("invalid rate") end
+        elif (.key | IN("refill_delay","ce_threshold","horizon","offload_horizon","timer_slack")) then
+          if (.value | type == "number" and . >= 0 and . == floor) then [.key,((.value|tostring)+(if .key == "timer_slack" then "ns" else "us" end))] else error("invalid time") end
+        elif .key == "pacing" and (.value|type) == "boolean" then
+          [if .value then "pacing" else "nopacing" end]
+        elif (.key | IN("horizon_drop","horizon_cap")) and .value == null then [.key]
+        else error("unsupported FQ option: " + .key) end
+      ) | flatten | .[]' <<< "$1"
+}
+
+# Explicitly authorized migration. Backups are evidence, not a promise to restore
+# the kernel-created zero handles or packets discarded by root replacement.
+pacing_migrate_zero_mq() {
+    local iface="$1" data layout state options encoded parent minor handle backup after leaf failed=0
+    local -a parents=() commands=() args=()
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
+    data=$(tc -j -d qdisc show dev "$iface") || return 1
+    layout=$(pacing_read_layout "$iface") || return 1
+    jq -e 'length > 1 and
+      ([.[]|select(.root == true)]|length == 1) and
+      all(.[]; if .root == true then .kind == "mq" and .handle == "0:"
+        else .kind == "fq" and .handle == "0:" and (.parent|test("^:[0-9a-fA-F]+$"))
+          and (.options.maxrate // 4294967295) == 4294967295 end)' <<< "$data" >/dev/null || {
+        pacing_error "仅迁移全部叶子为无限速 FQ 的默认零 handle mq；未修改队列。"; return 1;
+    }
+    [[ $(tc -j filter show dev "$iface" root) == '[]' ]] || {
+        pacing_error "存在过滤器或无法检查过滤器，拒绝迁移。"; return 1;
+    }
+    if [[ -e "$PACING_CONFIG_FILE" ]]; then
+        state=$(pacing_read_state) && state=$(pacing_normalize_state "$state") || return 1
+        pacing_same_layout "$state" "$layout" || return 1
+        [[ $(jq -r .phase <<< "$state") == pending ]] || return 1
+    fi
+    mapfile -t parents < <(jq -r '.targets[].parent' <<< "$layout")
+    for parent in "${parents[@]}"; do
+        minor=${parent#:}
+        (( 16#$minor > 0 && 16#$minor < 256 )) || return 1
+        options=$(jq -ce --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
+        encoded=$(pacing_fq_args "$options") || { pacing_error "FQ 参数不能安全重建，未修改队列。"; return 1; }
+        commands+=("$encoded")
+    done
+    backup="${PACING_CONFIG_FILE}.migration-${iface}-$(date +%s)-$$"
+    pacing_write_file "$backup" 600 "$data" || return 1
+    [[ ! -e "$PACING_CONFIG_FILE" ]] || cp -p -- "$PACING_CONFIG_FILE" "${backup}.state" || return 1
+    echo "原始队列参数已保存到 $backup"
+    tc qdisc replace dev "$iface" root handle 7ffe: mq || return 1
+    # Try every leaf even after an error, maximizing preservation of old options.
+    for ((minor=0; minor<${#parents[@]}; minor++)); do
+        parent=${parents[minor]#:}
+        printf -v handle '%x:' "$((0x7000 + 16#$parent))"
+        mapfile -t args <<< "${commands[minor]}"
+        tc qdisc replace dev "$iface" parent "7ffe:$parent" handle "$handle" fq "${args[@]}" || failed=1
+    done
+    after=$(tc -j -d qdisc show dev "$iface") || failed=1
+    for parent in "${parents[@]}"; do
+        options=$(jq -c --arg parent "$parent" '.[]|select(.parent == $parent)|.options' <<< "$data") || return 1
+        leaf=$(jq -ce --arg parent "7ffe:${parent#:}" '.[]|select(.parent == $parent and .kind == "fq")|.options' <<< "$after") || { failed=1; continue; }
+        jq -e --argjson expected "$options" 'contains($expected)' <<< "$leaf" >/dev/null || failed=1
+    done
+    if (( failed )); then
+        pacing_error "迁移未完整验证。已保留原始参数 $backup；不要继续限速，请用 [3] 检查。"
+        return 1
+    fi
+    [[ ! -e "$PACING_CONFIG_FILE" ]] || mv -- "$PACING_CONFIG_FILE" "${backup}.pending" || return 1
+    pacing_write_file "${PACING_CONFIG_FILE}.migrate-${iface}" 600 "$iface" || return 1
+    echo "已迁移为非零 handle 的 mq + FQ，原 FQ 参数已读回验证；现在可选择 [1] 限速。"
+    echo "关闭限速仅恢复上限，不会恢复零 handle；迁移时排队的数据包无法恢复。"
+}
+
+pacing_migrate_menu() {
+    local iface answer
+    ip -br link
+    read -r -p "迁移网卡（回车取消）: " iface || return 1
+    [[ -n "$iface" ]] || return 1
+    echo "将重建默认 mq + FQ 并备份参数；可能短暂丢包/中断，不能保证延迟不受影响。"
+    echo "成功后允许开机恢复时对该网卡同类默认队列再次迁移；不会设置 BBR 或 TCP 缓冲区。"
+    read -r -p "确认迁移？[y/N]: " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 1
+    pacing_locked pacing_migrate_zero_mq "$iface"
+}
+
 pacing_layout_rate() {
     jq -er '[.targets[].rate] | unique |
         if length == 1 then .[0] else error("各发送队列上限不一致") end' <<< "$1"
+}
+
+pacing_require_addressable() {
+    if jq -e '.topology == "mq-fq" and any(.targets[]; .parent|startswith(":"))' <<< "$1" >/dev/null; then
+        pacing_error "默认 mq 的零 handle 无法定址修改；请先选择 [7] 迁移，再选择 [1]。"
+        return 1
+    fi
 }
 
 pacing_normalize_state() {
@@ -11611,6 +11707,9 @@ pacing_set_layout_rate() {
         pacing_error "$iface 的某个 FQ 叶子上限已被其他工具修改；停止修改并保留记录。"
         return 1
     }
+    # Already restored is success; do not issue an impossible change to zero mq.
+    jq -e --argjson rate "$rate" 'all(.targets[]; .rate == $rate)' <<< "$layout" >/dev/null && return 0
+    pacing_require_addressable "$layout" || return 1
     mapfile -t parents < <(jq -r '.targets[].parent' <<< "$state") || return 1
     mapfile -t handles < <(jq -r '.targets[].handle' <<< "$state") || return 1
     for ((i=0; i<${#parents[@]}; i++)); do
@@ -11682,7 +11781,7 @@ pacing_enable_autostart() {
     pacing_valid_rate "$rate" && ((rate > 0 && rate < 4294967295)) || return 1
     command -v systemctl >/dev/null || { pacing_error "未找到 systemctl，无法设置开机恢复。"; return 1; }
     source="${BASH_SOURCE[0]}"
-    [[ -r "$source" ]] || { pacing_error "无法读取当前脚本，未设置开机恢复。"; return 1; }
+    [[ -f "$source" && -r "$source" ]] || { pacing_error "请先下载脚本为普通文件再运行，才能安装开机恢复。"; return 1; }
     dir=${PACING_INSTALLED_SCRIPT%/*}
     mkdir -p -- "$dir" || return 1
     install -m 700 -- "$source" "${PACING_INSTALLED_SCRIPT}.tmp" || return 1
@@ -11774,6 +11873,7 @@ pacing_apply_rate() {
     }
     layout=$(pacing_read_layout "$iface") || return 1
     boot=$(pacing_boot_id) && [[ -n "$boot" ]] || return 1
+    pacing_require_addressable "$layout" || return 1
     ifindex=$(pacing_ifindex "$iface") && [[ "$ifindex" =~ ^[0-9]+$ ]] || return 1
     topology=$(jq -r .topology <<< "$layout")
     targets=$(jq -c '[.targets[] | {parent,handle}]' <<< "$layout") || return 1
@@ -11861,6 +11961,11 @@ pacing_restore_boot() {
     fi
 
     layout=$(pacing_read_layout "$iface") || { pacing_error "网卡 $iface 尚未就绪或 FQ 布局不受支持。"; return 1; }
+    if [[ -f "${PACING_CONFIG_FILE}.migrate-${iface}" ]] &&
+       jq -e '.topology == "mq-fq" and all(.targets[]; .parent|startswith(":"))' <<< "$layout" >/dev/null; then
+        pacing_migrate_zero_mq "$iface" || return 1
+        layout=$(pacing_read_layout "$iface") || return 1
+    fi
     before=$(pacing_layout_rate "$layout") || {
         pacing_error "$iface 的各 FQ 发送队列上限不一致，拒绝自动恢复。"; return 1;
     }
@@ -12080,12 +12185,13 @@ manage_tcp_pacing_limit() {
         echo "4. 关闭并恢复本版本修改前的上限"
         echo "5. 清理旧版限速及全局调优配置"
         echo "6. 删除上次启动的过期记录"
+        echo "7. 迁移默认零 handle 的 mq + FQ（可能短暂丢包）"
         echo "0. 返回"
         read -r -p "请选择: " choice || return
         case "$choice" in
             1) pacing_enable_all;; 2) pacing_modify_rate;; 3) pacing_view_realtime;;
             4) pacing_disable_all;; 5) pacing_locked pacing_legacy_cleanup;;
-            6) pacing_locked pacing_forget_stale;; 0) return;; *) echo "无效选项";;
+            6) pacing_locked pacing_forget_stale;; 7) pacing_migrate_menu;; 0) return;; *) echo "无效选项";;
         esac
         break_end
     done
