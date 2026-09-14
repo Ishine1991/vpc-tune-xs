@@ -450,13 +450,30 @@ systemctl() { printf '%s\n' "$*" >> "$EVENTS"; }
 PACING_SCRIPT_SOURCE=/dev/fd/63
 curl() {
     printf '%s\\n' "$*" >> "$EVENTS"
-    local out=${!#}
-    printf 'pacing_restore_boot\\n' > "$out"
+    return 1
 }
 '''
         proc = self.run_shell('pacing_enable_autostart eth0 10485760', setup)
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse((self.base / 'installed/net-tcp-tune.sh').exists())
+        self.assertFalse((self.base / 'policy.json').exists())
+
+    def test_autostart_reuses_installed_script_when_pipe_source_is_empty(self):
+        installed = self.base / 'installed' / 'net-tcp-tune.sh'
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_text('#!/bin/bash\npacing_restore_boot\n', encoding='utf-8')
+        setup = '''
+systemctl() { printf '%s\n' "$*" >> "$EVENTS"; }
+PACING_SCRIPT_SOURCE=/dev/fd/63
+curl() {
+    printf '%s\\n' "$*" >> "$EVENTS"
+    return 1
+}
+'''
+        self.ok('pacing_enable_autostart eth0 102400', setup)
+        policy = json.loads((self.base / 'policy.json').read_text(encoding='utf-8'))
+        self.assertEqual(policy, {'version': 1, 'iface': 'eth0', 'rate': 102400})
+        self.assertEqual(installed.read_text(encoding='utf-8'), '#!/bin/bash\npacing_restore_boot\n')
         self.assertNotIn('raw.githubusercontent.com', self.events.read_text() if self.events.exists() else '')
 
     def test_legacy_not_executed_and_blocks_enable(self):

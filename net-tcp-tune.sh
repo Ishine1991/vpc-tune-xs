@@ -11384,6 +11384,7 @@ PACING_LOCK_FILE="/run/net-tcp-tune-pacing.lock"
 PACING_POLICY_FILE="/etc/net-tcp-tune-pacing-policy.json"
 PACING_SERVICE_FILE="/etc/systemd/system/net-tcp-tune-pacing.service"
 PACING_INSTALLED_SCRIPT="/usr/local/lib/net-tcp-tune/net-tcp-tune.sh"
+PACING_PUBLISHED_SCRIPT_URL="https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh"
 PACING_STATE_DIR="${PACING_STATE_DIR:-/etc/net-tcp-tune-pacing.d}"
 PACING_BOOT_RETRY_COUNT="${PACING_BOOT_RETRY_COUNT:-30}"
 PACING_BOOT_RETRY_SLEEP="${PACING_BOOT_RETRY_SLEEP:-2}"
@@ -12035,27 +12036,37 @@ pacing_policy_items() {
       else [.items[]] end' <<< "$policy"
 }
 
+pacing_script_has_restore() {
+    [[ -f "$1" && -r "$1" ]] && grep -q 'pacing_restore_boot' "$1"
+}
+
 pacing_install_running_script() {
     local dest="$1" source="${PACING_SCRIPT_SOURCE:-${BASH_SOURCE[0]}}" tmp
     tmp="${dest}.tmp"
     mkdir -p -- "${dest%/*}" || return 1
-    if [[ -f "$source" && -r "$source" ]]; then
-        install -m 700 -- "$source" "$tmp" || return 1
-    elif [[ -r "$source" ]]; then
-        # bash <(...) 的进程替换仍可读；只保存当前这份，不再回拉 main。
-        cat -- "$source" > "$tmp" || { rm -f -- "$tmp"; return 1; }
-        chmod 700 "$tmp" || { rm -f -- "$tmp"; return 1; }
-    else
-        pacing_error "无法读取当前运行的脚本，未安装开机恢复。请先把脚本保存为普通文件再运行。"
+    # bash <(curl) 的 /dev/fd/N 往往已被读空，不能当脚本源。
+    if [[ -f "$source" && -r "$source" && "$source" != /dev/fd/* && "$source" != /proc/self/fd/* ]]; then
+        if install -m 700 -- "$source" "$tmp" && grep -q 'pacing_restore_boot' "$tmp"; then
+            mv -f -- "$tmp" "$dest"
+            return 0
+        fi
         rm -f -- "$tmp"
-        return 1
     fi
-    grep -q 'pacing_restore_boot' "$tmp" || {
-        pacing_error "当前脚本不完整，未安装开机恢复。"
+    if pacing_script_has_restore "$dest"; then
+        echo "当前为在线运行，已保留现有开机恢复脚本，并更新恢复策略。"
+        return 0
+    fi
+    if command -v curl >/dev/null; then
+        echo "无法读取当前运行副本，正在下载开机恢复脚本..."
+        if curl -fsSL "${PACING_PUBLISHED_SCRIPT_URL}?$(date +%s)" -o "$tmp" &&
+           chmod 700 "$tmp" && grep -q 'pacing_restore_boot' "$tmp"; then
+            mv -f -- "$tmp" "$dest"
+            return 0
+        fi
         rm -f -- "$tmp"
-        return 1
-    }
-    mv -f -- "$tmp" "$dest"
+    fi
+    pacing_error "无法安装开机恢复脚本。请先把脚本保存为普通文件再运行。"
+    return 1
 }
 
 pacing_enable_autostart() {
