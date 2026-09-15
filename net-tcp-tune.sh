@@ -12148,8 +12148,8 @@ pacing_install_running_script() {
     mkdir -p -- "${dest%/*}" || return 1
     # bash <(curl) 的 /dev/fd/N 往往已被读空，不能当脚本源。
     if [[ -f "$source" && -r "$source" && "$source" != /dev/fd/* && "$source" != /proc/self/fd/* ]]; then
-        if install -m 700 -- "$source" "$tmp" && grep -q 'pacing_restore_boot' "$tmp"; then
-            mv -f -- "$tmp" "$dest"
+        if install -m 700 -- "$source" "$tmp" && grep -q 'pacing_restore_boot' "$tmp" && bash -n "$tmp"; then
+            mv -f -- "$tmp" "$dest" || return 1
             return 0
         fi
         rm -f -- "$tmp"

@@ -797,6 +797,12 @@ tc() {
         self.assertEqual(policy.read_text(), '{broken')
         self.assertFalse(self.events.exists())
 
+    def test_restore_script_rename_failure_does_not_apply_rate(self):
+        proc = self.run_shell('pacing_apply_persistent eth0 102400', 'mv() { return 1; }')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(self.events.exists())
+        self.assertFalse(self.config.exists())
+
     def test_migrate_is_noop_when_root_fq_already_addressable(self):
         setup = '''
 tc() {
