@@ -8,7 +8,7 @@ on:
       - .gitattributes
       - .github/workflows/pacing-tests.yml
   push:
-    branches: [main, fix/option39-pacing-recovery, fix/option39-zero-handle]
+    branches: [main, fix/option39-pacing-recovery, fix/option39-zero-handle, fix/option39-fq-mq-recovery]
     paths:
       - '**/*.sh'
       - tests/**

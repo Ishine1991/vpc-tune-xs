@@ -212,9 +212,11 @@ chmod +x net-tcp-tune.sh
 
 ## ⚠️ 常见问题
 
-### 功能 39：默认 mq + FQ 或单位搞错
+### 功能 39：默认根 FQ、mq + FQ 与速率单位
 
-直接 **39 → 1** 选择网卡并输入 `20`（= 20 MiB/s）即可。零 handle 的 `mq` 会自动迁移，不必先走选项 7。
+直接 **39 → 1** 选择网卡并输入 `20`（= 20 MiB/s）即可。零 handle 的根 FQ 或 mq 叶子会自动迁移，不必先走选项 7。mq 根的 handle 不限于 `7fxx:`；例如 `1:` 根下的默认 FQ 叶子也需要迁移。
+
+零 handle 默认队列不能直接使用 `tc qdisc change`，否则内核可能返回 `Qdisc not found. To create specify NLM_F_CREATE flag`。迁移会先备份队列参数，再建立非零 handle 并读回核对，可能短暂丢包。应用失败时只回滚实际发生变化的队列，已经恢复原速率的队列不会重复修改。`100K` 仍表示 100 KiB/s。
 
 若只要 20 KiB/s，输入 `20K` 并确认。`20M` 与纯数字 `20` 相同。这是字节/秒的 MiB，不是 20 Mbit/s。
 
@@ -223,7 +225,14 @@ chmod +x net-tcp-tune.sh
 迁移失败时脚本会保留当前队列（不再 `tc qdisc del root`）。用选项 3 检查，必要时再选 1 或 7。
 关闭限速只清每流上限，不会把 mq handle 改回内核默认 `0:`。
 
-`bash <(curl ...)` 安装开机恢复时，会把**当前正在运行的脚本**拷到 `/usr/local/lib/net-tcp-tune/`，不再另外拉一份 `main`。
+多网卡下，选项 2 输入 `0` 只关闭所选网卡；选项 4 关闭全部本版本限速。半完成的 mq 迁移只修复仍为零 handle 的叶子，保留已完成叶子；存在外部上限、损坏记录或旧版配置时先处理记录，不会直接重建队列。
+
+开机恢复会把**当前正在运行的普通脚本文件**拷到 `/usr/local/lib/net-tcp-tune/`。使用 `bash <(curl ...)` 时源文件可能已经读空，无法保证保存当前版本；此时会在限速前停止，不沿用旧副本或另拉 `main`。请保存文件后运行：
+
+```bash
+curl -fL https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh -o /root/net-tcp-tune.sh
+bash /root/net-tcp-tune.sh
+```
 
 **Q: 安装后运行 `bbr` 提示找不到命令？**
 A: 请执行 `source ~/.bashrc` 重新加载配置，或者断开 SSH 重连即可。

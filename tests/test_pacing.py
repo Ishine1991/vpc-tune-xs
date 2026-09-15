@@ -73,11 +73,18 @@ tc() {{
     printf '%s\\n' "$*" >> "$EVENTS"
     if [[ "$1" == -j ]]; then
         [[ "$READ_FAIL" != 1 ]] || return 2
+        if [[ "$2" == filter ]]; then echo '[]'; return; fi
+        if [[ "$2" == -d ]]; then shift; fi
         jq -c --arg dev "$5" '[.[$dev]]' "$KERNEL"
+    elif [[ "$1 $2" == 'qdisc replace' ]]; then
+        [[ "$5 $6 $8" == 'root handle fq' ]] || return 2
+        jq --arg dev "$4" --arg handle "$7" '.[$dev].handle=$handle' "$KERNEL" > "$KERNEL.tmp"
+        mv "$KERNEL.tmp" "$KERNEL"
     elif [[ "$1 $2" == 'qdisc change' ]]; then
         [[ "$FAIL_BEFORE" != 1 ]] || return 2
         local token=${{!#}} dev=$4 rate
         rate=${{token%bit}}
+        [[ $(jq -r --arg dev "$dev" '.[$dev].handle' "$KERNEL") != '0:' ]] || return 2
         if [[ "$6" == handle ]]; then
             [[ $(jq -r --arg dev "$dev" '.[$dev].handle' "$KERNEL") == "$7" ]] || return 2
         fi
@@ -112,9 +119,9 @@ tc() {{
         self.state.write_text(json.dumps({
             'eth0': [
                 {'kind': 'mq', 'handle': '1:', 'root': True, 'options': {}},
-                {'kind': 'fq', 'handle': '0:', 'parent': '1:2',
+                {'kind': 'fq', 'handle': '7002:', 'parent': '1:2',
                  'options': dict(leaf_options)},
-                {'kind': second_kind, 'handle': '0:', 'parent': '1:1',
+                {'kind': second_kind, 'handle': '7001:', 'parent': '1:1',
                  'options': dict(leaf_options)},
             ],
             'tun0': [{'kind': 'fq', 'handle': '8001:', 'root': True,
@@ -130,11 +137,23 @@ tc() {{
         return f'''tc() {{
     printf '%s\\n' "$*" >> "$EVENTS"
     if [[ "$1" == -j ]]; then
+        if [[ "$2" == -d ]]; then shift; fi
         jq -c --arg dev "$5" '.[$dev]' "$KERNEL"
+    elif [[ "$1 $2" == 'qdisc replace' ]]; then
+        [[ "$5 $7 $9" == 'parent handle fq' ]] || return 2
+        jq --arg dev "$4" --arg parent "$6" --arg handle "$8" \\
+          '.[$dev] |= map(if .parent == $parent then .handle=$handle else . end)' \\
+          "$KERNEL" > "$KERNEL.tmp" || return 2
+        mv "$KERNEL.tmp" "$KERNEL"
     elif [[ "$1 $2" == 'qdisc change' ]]; then
         local token=${{!#}} dev=$4 parent rate
         rate=${{token%bit}}
         if [[ "$5" == root ]]; then parent=root; else parent=$6; fi
+        if [[ "$parent" != root ]]; then
+            [[ "$7" == handle && "$8" != '0:' ]] || return 2
+            jq -e --arg dev "$dev" --arg parent "$parent" --arg handle "$8" \\
+              'any(.[$dev][]; .parent == $parent and .handle == $handle)' "$KERNEL" >/dev/null || return 2
+        fi
         {failure}
         jq --arg dev "$dev" --arg parent "$parent" --argjson rate "$((rate / 8))" \\
           '.[$dev] |= map(if ((.root == true and $parent == "root") or .parent == $parent)
@@ -305,16 +324,17 @@ ip() {
                 self.assertNotEqual(self.run_shell('pacing_apply_rate eth0 10485760').returncode, 0)
                 self.assertFalse(self.config.exists())
 
-    def test_default_handle_zero_is_changed_in_place_without_replacement(self):
+    def test_default_handle_zero_is_migrated_before_change(self):
         self.write_kernel()
         data = json.loads(self.state.read_text())
         data['eth0']['handle'] = '0:'
         self.state.write_text(json.dumps(data))
-        proc = self.run_shell('pacing_apply_rate eth0 10485760')
+        proc = self.run_shell('pacing_prepare_and_apply eth0 10485760')
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.rate(), 10485760)
         self.assertTrue(self.config.exists())
-        self.assertIn('qdisc change dev eth0 root fq maxrate 83886080bit', self.events.read_text())
+        self.assertIn('qdisc replace dev eth0 root handle 7ffe: fq', self.events.read_text())
+        self.assertIn('qdisc change dev eth0 root handle 7ffe: fq maxrate 83886080bit', self.events.read_text())
         self.assertNotIn('handle 0:', self.events.read_text())
         self.assertEqual(json.loads(self.state.read_text())['eth0']['options']['limit'], 1234)
 
@@ -327,9 +347,29 @@ ip() {
         self.assertEqual(data[0]['kind'], 'mq')
         self.assertEqual([x['options']['quantum'] for x in data[1:]], [3028, 3028])
         events = self.events.read_text()
-        self.assertIn('qdisc change dev eth0 parent 1:1 fq maxrate', events)
-        self.assertIn('qdisc change dev eth0 parent 1:2 fq maxrate', events)
+        self.assertIn('qdisc change dev eth0 parent 1:1 handle 7001: fq maxrate', events)
+        self.assertIn('qdisc change dev eth0 parent 1:2 handle 7002: fq maxrate', events)
         self.assertNotIn('qdisc change dev eth0 root', events)
+
+    def test_reported_vps_default_root_fq_100k(self):
+        data = json.loads(self.state.read_text())
+        options = {'limit': 10000, 'flow_limit': 100, 'buckets': 1024,
+                   'orphan_mask': 1023, 'quantum': 3028, 'initial_quantum': 15140,
+                   'low_rate_threshold': 68750, 'refill_delay': 40000,
+                   'timer_slack': 10000}
+        data['eth0'] = {'kind': 'fq', 'handle': '0:', 'root': True,
+                        'refcnt': 2, 'options': options}
+        self.state.write_text(json.dumps(data))
+        self.ok('pacing_prepare_and_apply eth0 "$(pacing_parse_rate 100K)"')
+        self.assertEqual(self.rate(), 102400)
+        events = self.events.read_text()
+        self.assertIn('refill_delay 40000us', events)
+        self.assertIn('timer_slack 10000ns', events)
+        self.ok('pacing_disable')
+        self.assertEqual(self.rate(), 4294967295)
+        after = json.loads(self.state.read_text())['eth0']['options']
+        for key, value in options.items():
+            self.assertEqual(after[key], value)
 
     def test_mq_partial_failure_rolls_back_all_leaves(self):
         self.write_kernel_mq()
@@ -337,6 +377,43 @@ ip() {
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(self.mq_rates(), [4294967295, 4294967295])
         self.assertFalse(self.config.exists())
+        changes = [line for line in self.events.read_text().splitlines() if 'qdisc change' in line]
+        self.assertEqual(len(changes), 3)  # failed second leaf was never changed
+
+    def test_zero_leaf_under_ordinary_mq_is_rejected_before_state_write(self):
+        self.write_kernel_mq()
+        data = json.loads(self.state.read_text())
+        for leaf in data['eth0'][1:]:
+            leaf['handle'] = '0:'
+        self.state.write_text(json.dumps(data))
+        proc = self.run_shell('pacing_apply_rate eth0 102400', self.mq_setup())
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(self.config.exists())
+        self.assertNotIn('qdisc change', self.events.read_text())
+
+    def test_option_one_migrates_ordinary_zero_mq_before_100k_apply(self):
+        self.write_kernel_mq()
+        data = json.loads(self.state.read_text())
+        for leaf in data['eth0'][1:]:
+            leaf['handle'] = '0:'
+        self.state.write_text(json.dumps(data))
+        setup = self.mq_setup() + '''
+pacing_migrate_zero_mq() {
+    echo migration >> "$EVENTS"
+    jq '.eth0 |= map(if .parent == "1:1" then .handle="7001:"
+        elif .parent == "1:2" then .handle="7002:" else . end)' "$KERNEL" > "$KERNEL.tmp"
+    mv "$KERNEL.tmp" "$KERNEL"
+}
+'''
+        self.ok('pacing_prepare_and_apply eth0 102400', setup)
+        self.assertEqual(self.mq_rates(), [102400, 102400])
+        events = self.events.read_text()
+        self.assertLess(events.index('migration'), events.index('qdisc change'))
+
+    def test_direct_zero_leaf_change_never_calls_tc(self):
+        proc = self.run_shell('pacing_change_target eth0 1:1 0: 102400')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(self.events.exists())
 
     def test_mq_disable_failure_restores_pre_disable_rates(self):
         self.write_kernel_mq()
@@ -409,7 +486,7 @@ pacing_write_state() { saves=$((saves+1)); [[ $saves != 2 ]] || return 1; origin
         self.ok('pacing_forget_stale', 'pacing_boot_id() { echo boot-2; }')
         self.assertFalse(self.config.exists())
 
-    def test_boot_restore_accepts_default_fq_handle_without_replacing_queue(self):
+    def test_boot_restore_migrates_default_fq_handle(self):
         data = json.loads(self.state.read_text())
         data['eth0']['handle'] = '0:'
         self.state.write_text(json.dumps(data))
@@ -464,7 +541,7 @@ curl() {
         self.assertFalse((self.base / 'installed/net-tcp-tune.sh').exists())
         self.assertFalse((self.base / 'policy.json').exists())
 
-    def test_autostart_reuses_installed_script_when_pipe_source_is_empty(self):
+    def test_autostart_does_not_substitute_stale_script_for_pipe_source(self):
         installed = self.base / 'installed' / 'net-tcp-tune.sh'
         installed.parent.mkdir(parents=True, exist_ok=True)
         installed.write_text('#!/bin/bash\npacing_restore_boot\n', encoding='utf-8')
@@ -476,9 +553,9 @@ curl() {
     return 1
 }
 '''
-        self.ok('pacing_enable_autostart eth0 102400', setup)
-        policy = json.loads((self.base / 'policy.json').read_text(encoding='utf-8'))
-        self.assertEqual(policy, {'version': 1, 'iface': 'eth0', 'rate': 102400})
+        self.assertNotEqual(self.run_shell('pacing_apply_persistent eth0 102400', setup).returncode, 0)
+        self.assertFalse((self.base / 'policy.json').exists())
+        self.assertEqual(self.rate(), 4294967295)
         self.assertEqual(installed.read_text(encoding='utf-8'), '#!/bin/bash\npacing_restore_boot\n')
         self.assertNotIn('raw.githubusercontent.com', self.events.read_text() if self.events.exists() else '')
 
@@ -650,6 +727,75 @@ tc() {
         self.assertEqual(policy['version'], 2)
         items = {item['iface']: item['rate'] for item in policy['items']}
         self.assertEqual(items, {'eth0': 10485760, 'tun0': 20971520})
+
+    def test_migration_keeps_other_interface_record(self):
+        self.ok('pacing_apply_rate tun0 10485760')
+        data = json.loads(self.state.read_text())
+        data['eth0']['handle'] = '0:'
+        self.state.write_text(json.dumps(data))
+        self.ok('pacing_prepare_and_apply eth0 102400')
+        self.assertEqual(self.rate('tun0'), 10485760)
+        self.assertEqual(self.rate(), 102400)
+        self.assertTrue((self.base / 'states' / 'tun0.json').exists())
+
+    def test_foreign_limit_blocks_zero_root_migration(self):
+        self.write_kernel(rate=123456)
+        data = json.loads(self.state.read_text())
+        data['eth0']['handle'] = '0:'
+        self.state.write_text(json.dumps(data))
+        self.assertNotEqual(self.run_shell('pacing_prepare_and_apply eth0 102400').returncode, 0)
+        self.assertNotIn('qdisc replace', self.events.read_text())
+        self.assertEqual(self.rate(), 123456)
+
+    def test_legacy_sysctl_blocks_migration_before_any_replace(self):
+        data = json.loads(self.state.read_text())
+        data['eth0']['handle'] = '0:'
+        self.state.write_text(json.dumps(data))
+        (self.base / 'old.conf').write_text('legacy')
+        self.assertNotEqual(self.run_shell('pacing_prepare_and_apply eth0 102400').returncode, 0)
+        self.assertNotIn('qdisc replace', self.events.read_text())
+
+    def test_migration_rate_readback_is_not_ignored(self):
+        self.assertNotEqual(self.run_shell(
+            "pacing_fq_options_match '{\"limit\":10000,\"maxrate\":123}' '{\"limit\":10000}'").returncode, 0)
+
+    def test_mixed_partial_mq_migration_keeps_completed_leaf(self):
+        self.write_kernel_mq()
+        data = json.loads(self.state.read_text())
+        data['eth0'][1]['handle'] = '0:'
+        self.state.write_text(json.dumps(data))
+        self.ok('pacing_prepare_and_apply eth0 102400', self.mq_setup())
+        events = self.events.read_text()
+        self.assertIn('qdisc replace dev eth0 parent 1:2 handle 7002:', events)
+        self.assertNotIn('qdisc replace dev eth0 parent 1:1', events)
+        self.assertEqual(self.mq_rates(), [102400, 102400])
+
+    def test_partial_migration_refuses_handle_collision(self):
+        self.write_kernel_mq()
+        data = json.loads(self.state.read_text())
+        data['eth0'][1]['handle'] = '0:'
+        data['eth0'][2]['handle'] = '7002:'
+        self.state.write_text(json.dumps(data))
+        self.assertNotEqual(self.run_shell('pacing_prepare_and_apply eth0 102400', self.mq_setup()).returncode, 0)
+        self.assertNotIn('qdisc replace', self.events.read_text())
+
+    def test_disable_selected_iface_keeps_other_rate_and_policy(self):
+        setup = 'systemctl() { printf "%s\\n" "$*" >> "$EVENTS"; }'
+        self.ok('pacing_apply_persistent eth0 102400; pacing_apply_persistent tun0 20971520', setup)
+        self.ok('pacing_disable_iface eth0', setup)
+        self.assertEqual(self.rate(), 4294967295)
+        self.assertEqual(self.rate('tun0'), 20971520)
+        policy = json.loads((self.base / 'policy.json').read_text())
+        self.assertEqual(policy['items'], [{'iface': 'tun0', 'rate': 20971520}])
+        self.assertTrue((self.base / 'pacing.service').exists())
+
+    def test_invalid_policy_is_preserved_before_applying_rate(self):
+        policy = self.base / 'policy.json'
+        policy.write_text('{broken')
+        proc = self.run_shell('pacing_apply_persistent eth0 102400')
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(policy.read_text(), '{broken')
+        self.assertFalse(self.events.exists())
 
     def test_migrate_is_noop_when_root_fq_already_addressable(self):
         setup = '''

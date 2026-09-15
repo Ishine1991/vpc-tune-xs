@@ -39,6 +39,16 @@ jq -e '.options.limit == 1234 and .options.flow_limit == 45' <<< "$root" >/dev/n
 # CI sets default_qdisc=fq on its disposable runner, not on a production host.
 # Multi-queue dummy auto-attaches mq + FQ with kernel zero handles; TAP is fallback.
 if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
+    # A single-queue TAP reproduces the reported default root FQ (handle 0:).
+    ip tuntap add dev pacingroot mode tap
+    ip link set pacingroot up
+    root=$(pacing_read_root pacingroot)
+    jq -e '.kind == "fq" and .handle == "0:"' <<< "$root" >/dev/null
+    pacing_locked pacing_prepare_and_apply pacingroot 102400
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingroot)") == 102400 ]]
+    pacing_locked pacing_disable
+    pacing_fq_options_match "$(jq -c .options <<< "$(pacing_read_root pacingroot)")" \
+        "$(jq -c .options <<< "$root")"
     ip link add pacingzero numtxqueues 2 type dummy
     ip link set pacingzero up
     zero=$(tc -j -d qdisc show dev pacingzero)
@@ -62,9 +72,10 @@ if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
     # Simulate a half-finished migration: nonzero mq root, leaves still handle 0:.
     root=$(jq -r '.[]|select(.root==true)|.handle' <<< "$(tc -j qdisc show dev pacingzero)")
     root_hex=${root%:}
-    while IFS= read -r parent; do
-        tc qdisc replace dev pacingzero parent "$parent" handle 0: fq
-    done < <(jq -r '.[]|select(.parent!=null)|.parent' <<< "$(tc -j qdisc show dev pacingzero)")
+    # Passing handle 0: to replace allocates a handle; recreating mq generates
+    # genuine kernel-owned zero-handle leaves instead.
+    tc qdisc del dev pacingzero root
+    tc qdisc replace dev pacingzero root handle "$root" mq
     jq -e --arg root "$root" 'any(.[]; .root==true and .handle==$root) and
       all(.[]|select(.parent!=null); .handle=="0:")' <<< "$(tc -j qdisc show dev pacingzero)" >/dev/null
     pacing_locked pacing_migrate_zero_mq pacingzero
@@ -88,8 +99,21 @@ fi
 ip link add pacingmq numtxqueues 2 type veth peer name pacingpeer numtxqueues 2
 ip link set pacingmq up
 tc qdisc replace dev pacingmq root handle 1: mq
-tc qdisc replace dev pacingmq parent 1:1 fq limit 2345 flow_limit 67
-tc qdisc replace dev pacingmq parent 1:2 fq limit 2345 flow_limit 67
+# A normal mq root (outside the migration's 7fxx range) also has zero-handle
+# automatic leaves. Exercise option 1 before explicitly configuring the leaves.
+if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
+    initial=$(pacing_read_layout pacingmq)
+    jq -e 'all(.targets[]; .handle == "0:")' <<< "$initial" >/dev/null
+    # One leaf completed and one still zero: resume without replacing leaf 1.
+    tc qdisc replace dev pacingmq parent 1:1 handle 7001: fq limit 2345 flow_limit 67
+    pacing_locked pacing_prepare_and_apply pacingmq 102400
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingmq)") == 102400 ]]
+    tc -j qdisc show dev pacingmq | jq -e 'any(.[];
+        .parent == "1:1" and .handle == "7001:" and .options.limit == 2345)' >/dev/null
+    pacing_locked pacing_disable
+fi
+tc qdisc replace dev pacingmq parent 1:1 handle 7001: fq limit 2345 flow_limit 67
+tc qdisc replace dev pacingmq parent 1:2 handle 7002: fq limit 2345 flow_limit 67
 pacing_locked pacing_apply_rate pacingmq 10485760
 layout=$(pacing_read_layout pacingmq)
 [[ $(jq -r .topology <<< "$layout") == mq-fq ]]
