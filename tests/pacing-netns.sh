@@ -63,7 +63,13 @@ if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
         jq -e 'any(.[]; .kind == "mq" and .root == true and .handle == "0:") and
           ([.[]|select(.kind == "fq" and .handle == "0:")]|length >= 1)' <<< "$zero" >/dev/null
     fi
+    # Migrating a second interface must not reject, archive, or remove the
+    # first interface's active recovery record.
+    pacing_locked pacing_apply_rate pacingroot 102400
+    saved_root_state=$(cat "$PACING_CONFIG_FILE")
     pacing_locked pacing_migrate_zero_mq pacingzero
+    [[ $(cat "$PACING_CONFIG_FILE") == "$saved_root_state" ]]
+    pacing_locked pacing_disable
     pacing_locked pacing_apply_rate pacingzero 20480
     [[ $(pacing_layout_rate "$(pacing_read_layout pacingzero)") == 20480 ]]
     pacing_locked pacing_apply_rate pacingzero 20971520

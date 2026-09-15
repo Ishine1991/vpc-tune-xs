@@ -11810,6 +11810,7 @@ pacing_migrate_zero_mq() {
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     data=$(tc -j -d qdisc show dev "$iface") || return 1
     if pacing_is_partial_migrate "$data"; then
+        pacing_migration_preflight "$iface" "$(pacing_read_layout "$iface")" || return 1
         pacing_migrate_mq_leaves "$iface" "$data"
         return $?
     fi
@@ -11823,17 +11824,13 @@ pacing_migrate_zero_mq() {
         return 1
     fi
     layout=$(pacing_read_layout "$iface") || return 1
+    pacing_migration_preflight "$iface" "$layout" || return 1
     filters=$(tc -j filter show dev "$iface" root) || {
         pacing_error "无法检查过滤器，拒绝迁移。"; return 1;
     }
     [[ "$filters" == '[]' || -z "$filters" ]] || {
         pacing_error "存在过滤器或无法检查过滤器，拒绝迁移。"; return 1;
     }
-    if [[ -e "$PACING_CONFIG_FILE" ]]; then
-        state=$(pacing_read_state) && state=$(pacing_normalize_state "$state") || return 1
-        pacing_same_layout "$state" "$layout" || return 1
-        [[ $(jq -r .phase <<< "$state") == pending ]] || return 1
-    fi
     root_hex=$(pacing_pick_mq_root_handle "$data") || return 1
     mapfile -t parents < <(jq -r '.targets[].parent' <<< "$layout")
     for parent in "${parents[@]}"; do
@@ -11847,7 +11844,6 @@ pacing_migrate_zero_mq() {
     done
     backup="${PACING_CONFIG_FILE}.migration-${iface}-$(date +%s)-$$"
     pacing_write_file "$backup" 600 "$data" || return 1
-    [[ ! -e "$PACING_CONFIG_FILE" ]] || cp -p -- "$PACING_CONFIG_FILE" "${backup}.state" || return 1
     echo "原始队列参数已保存到 $backup"
     after=$(tc -j -d qdisc show dev "$iface") || return 1
     left=$(jq -cS 'sort_by(.parent // "root")' <<< "$after") || return 1
@@ -11881,7 +11877,6 @@ pacing_migrate_zero_mq() {
         pacing_error "迁移未完整验证，已保留当前根队列（未删除）。原始参数 $backup；请用 [3] 检查后重试 [1] 或 [7]。"
         return 1
     fi
-    [[ ! -e "$PACING_CONFIG_FILE" ]] || mv -- "$PACING_CONFIG_FILE" "${backup}.pending" || return 1
     pacing_write_file "${PACING_CONFIG_FILE}.migrate-${iface}" 600 "$iface ${root_hex}:" || return 1
     echo "已迁移为非零 handle 的 mq + FQ，原 FQ 参数已读回验证；现在可选择 [1] 限速。"
     echo "关闭限速仅恢复上限，不会恢复零 handle；迁移时排队的数据包无法恢复。"
