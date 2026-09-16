@@ -527,7 +527,7 @@ pacing_write_state() { saves=$((saves+1)); [[ $saves != 2 ]] || return 1; origin
         self.assertIn('pacing_restore_boot', (self.base / 'installed/net-tcp-tune.sh').read_text(encoding='utf-8'))
         self.assertNotIn('raw.githubusercontent.com', self.events.read_text() if self.events.exists() else '')
 
-    def test_autostart_rejects_unreadable_source_without_download(self):
+    def test_autostart_rejects_pipe_source_when_download_fails(self):
         setup = '''
 systemctl() { printf '%s\n' "$*" >> "$EVENTS"; }
 PACING_SCRIPT_SOURCE=/dev/fd/63
@@ -540,8 +540,9 @@ curl() {
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse((self.base / 'installed/net-tcp-tune.sh').exists())
         self.assertFalse((self.base / 'policy.json').exists())
+        self.assertIn('raw.githubusercontent.com', self.events.read_text())
 
-    def test_autostart_does_not_substitute_stale_script_for_pipe_source(self):
+    def test_autostart_does_not_substitute_stale_script_when_download_fails(self):
         installed = self.base / 'installed' / 'net-tcp-tune.sh'
         installed.parent.mkdir(parents=True, exist_ok=True)
         installed.write_text('#!/bin/bash\npacing_restore_boot\n', encoding='utf-8')
@@ -557,7 +558,35 @@ curl() {
         self.assertFalse((self.base / 'policy.json').exists())
         self.assertEqual(self.rate(), 4294967295)
         self.assertEqual(installed.read_text(encoding='utf-8'), '#!/bin/bash\npacing_restore_boot\n')
-        self.assertNotIn('raw.githubusercontent.com', self.events.read_text() if self.events.exists() else '')
+        self.assertIn('raw.githubusercontent.com', self.events.read_text())
+
+    def test_autostart_pipe_source_downloads_published_script(self):
+        installed = self.base / 'installed' / 'net-tcp-tune.sh'
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_text('#!/bin/bash\nSTALE\npacing_restore_boot\n', encoding='utf-8')
+        setup = '''
+systemctl() { printf '%s\n' "$*" >> "$EVENTS"; }
+PACING_SCRIPT_SOURCE=/dev/fd/63
+curl() {
+    printf '%s\\n' "$*" >> "$EVENTS"
+    local dest=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == -o ]]; then dest="$2"; shift 2; continue; fi
+        shift
+    done
+    [[ -n "$dest" ]] || return 1
+    printf '%s\\n' '#!/bin/bash' 'pacing_restore_boot() { :; }' 'pacing_apply_persistent() { :; }' > "$dest"
+}
+'''
+        self.ok('pacing_apply_persistent eth0 102400', setup)
+        self.assertTrue(installed.exists())
+        text = installed.read_text(encoding='utf-8')
+        self.assertIn('pacing_restore_boot', text)
+        self.assertIn('pacing_apply_persistent', text)
+        self.assertNotIn('STALE', text)
+        self.assertEqual(self.rate(), 102400)
+        self.assertTrue((self.base / 'policy.json').exists())
+        self.assertIn('raw.githubusercontent.com', self.events.read_text())
 
     def test_legacy_not_executed_and_blocks_enable(self):
         self.config.write_text('echo CONFIG_EXECUTED\n')

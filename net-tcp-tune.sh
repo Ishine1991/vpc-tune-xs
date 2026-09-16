@@ -11384,6 +11384,7 @@ PACING_LOCK_FILE="/run/net-tcp-tune-pacing.lock"
 PACING_POLICY_FILE="/etc/net-tcp-tune-pacing-policy.json"
 PACING_SERVICE_FILE="/etc/systemd/system/net-tcp-tune-pacing.service"
 PACING_INSTALLED_SCRIPT="/usr/local/lib/net-tcp-tune/net-tcp-tune.sh"
+PACING_PUBLISHED_SCRIPT_URL="https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh"
 PACING_STATE_DIR="${PACING_STATE_DIR:-/etc/net-tcp-tune-pacing.d}"
 PACING_BOOT_RETRY_COUNT="${PACING_BOOT_RETRY_COUNT:-30}"
 PACING_BOOT_RETRY_SLEEP="${PACING_BOOT_RETRY_SLEEP:-2}"
@@ -12154,9 +12155,20 @@ pacing_install_running_script() {
         fi
         rm -f -- "$tmp"
     fi
-    # An older installed script or a moving main branch may use a different
-    # recovery format. Never silently substitute either for the running copy.
-    pacing_error "无法安装开机恢复脚本。请先把脚本保存为普通文件再运行。"
+    # 在线运行时再拉一份 GitHub main，不复用机上可能过期的旧副本。
+    if command -v curl >/dev/null; then
+        echo "当前为在线运行，正在下载开机恢复脚本..."
+        if curl -fsSL "${PACING_PUBLISHED_SCRIPT_URL}?$(date +%s)" -o "$tmp" &&
+           chmod 700 "$tmp" &&
+           grep -q 'pacing_restore_boot' "$tmp" &&
+           grep -q 'pacing_apply_persistent' "$tmp" &&
+           bash -n "$tmp"; then
+            mv -f -- "$tmp" "$dest" || return 1
+            return 0
+        fi
+        rm -f -- "$tmp"
+    fi
+    pacing_error "无法安装开机恢复脚本。请先把脚本保存为普通文件再运行，或检查本机能否访问 GitHub。"
     return 1
 }
 
@@ -12443,7 +12455,7 @@ pacing_enable_all() {
     if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_disable_all; return $?; fi
     echo "对所选网卡的出站 FQ 流设置每流上限（含 TCP/UDP，不是整卡总带宽，不管入站）。"
     echo "不改 BBR / TCP 缓冲区。零 handle 的根 FQ 或 mq 叶子会自动迁移（可能短暂丢包）。"
-    echo "与菜单 36 的 CAKE 互斥；成功后会安装开机恢复（使用当前这份脚本，不回拉 main）。"
+    echo "与菜单 36 的 CAKE 互斥；成功后会安装开机恢复。普通文件运行会安装当前这份；在线 curl 会再下载一份 GitHub main。"
     pacing_warn_qdisc_conflict
     pacing_pick_iface || return 1
     pacing_locked pacing_apply_persistent "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"

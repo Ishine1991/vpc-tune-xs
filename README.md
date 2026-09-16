@@ -11,7 +11,7 @@ virtio 等网卡常见根 `mq handle 0:`、叶子 `parent :1/:2`。选项 **1 �
 - 依赖：`iproute2 jq util-linux`；Debian/Ubuntu 以及 dnf/yum/apk 可尝试自动安装。
 - `20` 或 `20M` = 20 MiB/s；`20K` = 20 KiB/s；`0` 或子菜单 4 关闭。低于 1 MiB/s 会二次确认。
 - 可对多张网卡分别限速；换网卡不必先关原来的。
-- 开机恢复使用**当时运行的那份脚本**，不再回拉 GitHub `main`。网卡未就绪会重试。
+- 开机恢复：若脚本是普通文件，会安装当时运行的那份；若用 `bash <(curl …)` 在线跑，会再下载一份 GitHub `main`（不复用机上可能过期的旧副本）。网卡未就绪会重试。
 - 已使用旧版的机器先执行 **39 → 5**。
 - 修改的是本地源码；在线 `curl` 安装仍取远端，需要先发布才会更新远端。
 
@@ -227,7 +227,7 @@ chmod +x net-tcp-tune.sh
 
 多网卡下，选项 2 输入 `0` 只关闭所选网卡；选项 4 关闭全部本版本限速。半完成的 mq 迁移只修复仍为零 handle 的叶子，保留已完成叶子；存在外部上限、损坏记录或旧版配置时先处理记录，不会直接重建队列。
 
-开机恢复会把**当前正在运行的普通脚本文件**拷到 `/usr/local/lib/net-tcp-tune/`。使用 `bash <(curl ...)` 时源文件可能已经读空，无法保证保存当前版本；此时会在限速前停止，不沿用旧副本或另拉 `main`。请保存文件后运行：
+开机恢复会把**当前正在运行的普通脚本文件**拷到 `/usr/local/lib/net-tcp-tune/`。使用 `bash <(curl ...)` 或 `bbr` 别名时源文件往往已经读空，脚本会再下载一份 GitHub `main` 作为开机恢复副本（不沿用机上可能过期的旧文件）。下载失败时会在限速前停止。也可先保存再运行：
 
 ```bash
 curl -fL https://raw.githubusercontent.com/Ishine1991/vpc-tune-xs/main/net-tcp-tune.sh -o /root/net-tcp-tune.sh
