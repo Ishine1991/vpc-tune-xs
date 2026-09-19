@@ -114,9 +114,10 @@ if [[ ${PACING_TEST_DEFAULT_CODEL:-0} == 1 ]]; then
     fi
     pacing_codel_layout "$data" >/dev/null
     jq -e 'all(.[]; .handle == "0:")' <<< "$data" >/dev/null
-    # Fail the second FQ leaf once; verify the real rollback serializer.
+    # TAP fallback can have one TX queue; fail its last leaf, not a guessed :2.
+    fail_minor=$(jq -r '[.[]|select(.parent!=null)|.parent|split(":")|last]|sort|last' <<< "$data")
     tc() {
-        if [[ "$*" == 'qdisc replace dev pacingaws parent 7ffe:2 handle 7002: fq pacing' &&
+        if [[ "$1 $2 $4 $5 $6 $9" == "qdisc replace pacingaws parent 7ffe:$fail_minor fq" &&
               ! -e "$work/failed" ]]; then
             touch "$work/failed"; return 2
         fi
@@ -128,6 +129,15 @@ if [[ ${PACING_TEST_DEFAULT_CODEL:-0} == 1 ]]; then
     unset -f tc
     rolled=$(tc -j -d qdisc show dev pacingaws)
     pacing_codel_layout "$rolled" >/dev/null
+    jq -e --argjson old "$data" '
+      [.[]|select(.parent!=null)|.options] as $now |
+      [$old[]|select(.parent!=null)|.options] as $before |
+      ($now|length)==($before|length) and
+      all(range(0; $before|length); . as $i |
+        all($before[$i]|to_entries[];
+          if .key=="target" or .key=="interval" or .key=="ce_threshold" then
+            ($now[$i][.key] - .value | fabs) <= 1
+          else $now[$i][.key] == .value end))' <<< "$rolled" >/dev/null
     [[ ! -e "$PACING_CONFIG_FILE" ]]
     # Retry from the addressed mq left by rollback.
     pacing_locked pacing_prepare_and_apply pacingaws 51200
