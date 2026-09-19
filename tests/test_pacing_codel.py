@@ -36,10 +36,16 @@ tc() {
         jq --arg h "$7" '.eth0 |= map(if .root then .handle=$h
           else .parent=($h + (.parent|split(":")|last)) end)' "$KERNEL" > "$KERNEL.tmp"
     elif [[ "$2 $5" == 'replace parent' ]]; then
+        local new_handle new_kind
+        if [[ "$7" == handle ]]; then new_handle=$8; new_kind=$9
+        else new_handle="a${6##*:}:"; new_kind=$7; fi
         if [[ "${FAIL_LEAF:-}" == "$6" && "$9" == fq && ! -f "$KERNEL.failed" ]]; then
             touch "$KERNEL.failed"; return 2
         fi
-        jq --arg p "$6" --arg h "$8" --arg kind "$9" --slurpfile orig "$KERNEL.original" '
+        # Model Linux's rejection of changing qdisc kind at an existing handle.
+        if jq -e --arg h "$new_handle" --arg kind "$new_kind" \
+            'any(.eth0[]; .handle==$h and .kind!=$kind)' "$KERNEL" >/dev/null; then return 2; fi
+        jq --arg p "$6" --arg h "$new_handle" --arg kind "$new_kind" --slurpfile orig "$KERNEL.original" '
           .eth0 |= map(if .parent==$p then .handle=$h | .kind=$kind |
             .options=(if $kind=="fq" then {pacing:true,limit:10000}
               else [$orig[0].eth0[]|select(.parent != null and

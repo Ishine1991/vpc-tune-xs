@@ -11705,8 +11705,8 @@ pacing_codel_args() {
 
 pacing_migrate_codel_mq() {
     local iface="$1" data="$2" layout root root_hex backup after filters index
-    local parent minor handle options encoded i failed=0 touched=0 leaf
-    local -a parents=() handles=() commands=() args=()
+    local parent minor handle options encoded i candidate failed=0 touched=0 leaf
+    local -a parents=() handles=() commands=() args=() restore_handle=()
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     layout=$(pacing_codel_layout "$data") || return 1
     # No current rate state can legitimately describe fq_codel.
@@ -11733,8 +11733,14 @@ pacing_migrate_codel_mq() {
     for parent in "${parents[@]}"; do
         minor=${parent#*:}
         handle=$(pacing_leaf_handle "$minor" "$root_hex") || return 1
-        jq -e --arg h "$handle" --arg p "$parent" 'all(.[]; .handle != $h or .parent == $p)' \
-            <<< "$data" >/dev/null || { pacing_error "迁移 handle 冲突。"; return 1; }
+        # A same-handle replace is a change, and Linux rejects a kind change.
+        # Allocate an unused handle even when the old one belongs to this leaf.
+        candidate=$((16#${handle%:}))
+        while ! jq -e --arg h "$handle" 'all(.[]; .handle != $h)' <<< "$data" >/dev/null; do
+            candidate=$((candidate + 0x1000))
+            (( candidate <= 0xffff )) || { pacing_error "没有可用的 FQ 叶子 handle。"; return 1; }
+            printf -v handle '%x:' "$candidate"
+        done
         handles+=("$handle")
         options=$(jq -ce --arg p "$parent" '.leaves[]|select(.parent==$p)|.options' <<< "$layout") || return 1
         encoded=$(pacing_codel_args "$options") || { pacing_error "FQ_CoDel 参数不能安全重建，未修改队列。"; return 1; }
@@ -11781,14 +11787,22 @@ pacing_migrate_codel_mq() {
         for ((i=0; i<touched; i++)); do
             parent="${root_hex}:${parents[i]#*:}"
             handle=$(jq -r --arg p "${parents[i]}" '.leaves[]|select(.parent==$p)|.handle' <<< "$layout")
-            [[ "$handle" != 0: ]] || handle=${handles[i]}
+            options=$(jq -c --arg p "${parents[i]}" '.leaves[]|select(.parent==$p)|.options' <<< "$layout")
+            leaf=$(tc -j -d qdisc show dev "$iface") || leaf='[]'
+            # A failed replace may leave the original leaf intact. Replaying
+            # immutable fq_codel options (flows) via change would itself fail.
+            if jq -e --arg p "$parent" --arg h "$handle" --argjson old "$options" \
+                'any(.[]; .parent==$p and .handle==$h and .kind=="fq_codel" and .options==$old)' \
+                <<< "$leaf" >/dev/null; then continue; fi
+            restore_handle=()
+            if [[ "$handle" != 0: ]]; then restore_handle=(handle "$handle"); fi
             mapfile -t args < <(printf '%s\n' "${commands[i]}")
-            tc qdisc replace dev "$iface" parent "$parent" handle "$handle" fq_codel "${args[@]}" || \
+            tc qdisc replace dev "$iface" parent "$parent" "${restore_handle[@]}" fq_codel "${args[@]}" || \
                 pacing_error "$parent 回滚失败；请用 [3] 核对，备份 $backup。"
             leaf=$(tc -j -d qdisc show dev "$iface") || leaf='[]'
             options=$(jq -c --arg p "${parents[i]}" '.leaves[]|select(.parent==$p)|.options' <<< "$layout")
             jq -e --arg p "$parent" --arg h "$handle" --argjson old "$options" '
-              any(.[]; .parent==$p and .handle==$h and .kind=="fq_codel" and
+              any(.[]; .parent==$p and ($h=="0:" or .handle==$h) and .kind=="fq_codel" and
                 (.options as $actual | all($old|to_entries[];
                   if .key=="target" or .key=="interval" or .key=="ce_threshold" then
                     ($actual[.key] - .value | fabs) <= 1
