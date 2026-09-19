@@ -117,7 +117,7 @@ if [[ ${PACING_TEST_DEFAULT_CODEL:-0} == 1 ]]; then
     # TAP fallback can have one TX queue; fail its last leaf, not a guessed :2.
     fail_minor=$(jq -r '[.[]|select(.parent!=null)|.parent|split(":")|last]|sort|last' <<< "$data")
     tc() {
-        if [[ "$1 $2 $4 $5 $6 $9" == "qdisc replace pacingaws parent 7ffe:$fail_minor fq" &&
+        if [[ "${1:-} ${2:-} ${4:-} ${5:-} ${6:-} ${9:-}" == "qdisc replace pacingaws parent 7ffe:$fail_minor fq" &&
               ! -e "$work/failed" ]]; then
             touch "$work/failed"; return 2
         fi
@@ -162,7 +162,7 @@ if [[ ${PACING_TEST_DEFAULT_CODEL:-0} == 1 ]]; then
     pacing_codel_layout "$data" >/dev/null
     [[ $(jq '[.[]|select(.parent!=null)]|length' <<< "$data") == 2 ]]
     tc() {
-        if [[ "$1 $2 $4 $5 $6 $9" == 'qdisc replace pacingmq parent 1:2 fq' &&
+        if [[ "${1:-} ${2:-} ${4:-} ${5:-} ${6:-} ${9:-}" == 'qdisc replace pacingmq parent 1:2 fq' &&
               ! -e "$work/failed-second" ]]; then
             touch "$work/failed-second"; return 2
         fi
