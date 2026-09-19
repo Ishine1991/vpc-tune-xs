@@ -157,6 +157,26 @@ fi
 ip link add pacingmq numtxqueues 2 type veth peer name pacingpeer numtxqueues 2
 ip link set pacingmq up
 tc qdisc replace dev pacingmq root handle 1: mq
+if [[ ${PACING_TEST_DEFAULT_CODEL:-0} == 1 ]]; then
+    data=$(tc -j -d qdisc show dev pacingmq)
+    pacing_codel_layout "$data" >/dev/null
+    [[ $(jq '[.[]|select(.parent!=null)]|length' <<< "$data") == 2 ]]
+    tc() {
+        if [[ "$1 $2 $4 $5 $6 $9" == 'qdisc replace pacingmq parent 1:2 fq' &&
+              ! -e "$work/failed-second" ]]; then
+            touch "$work/failed-second"; return 2
+        fi
+        command tc "$@"
+    }
+    if pacing_prepare_and_apply pacingmq 51200; then
+        echo 'Expected second-leaf conversion failure' >&2; exit 1
+    fi
+    unset -f tc
+    pacing_codel_layout "$(tc -j -d qdisc show dev pacingmq)" >/dev/null
+    pacing_locked pacing_prepare_and_apply pacingmq 51200
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingmq)") == 51200 ]]
+    pacing_locked pacing_disable
+fi
 # A normal mq root (outside the migration's 7fxx range) also has zero-handle
 # automatic leaves. Exercise option 1 before explicitly configuring the leaves.
 if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
