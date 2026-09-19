@@ -11666,6 +11666,141 @@ pacing_mq_root_handle() {
         if length == 1 then .[0].handle else error("mq root missing") end' <<< "$1"
 }
 
+# Conversion is separate from read_layout: fq_codel must never be treated as FQ
+# by rate changes or state validation. Only a homogeneous, flat mq is eligible.
+pacing_codel_layout() {
+    jq -ce '
+      [.[]|select(.root == true)] as $roots |
+      select(($roots|length) == 1 and $roots[0].kind == "mq") |
+      $roots[0].handle as $root |
+      select($root|test("^[0-9a-fA-F]+:$")) |
+      [.[]|select(.root != true)] as $leaves |
+      select(($leaves|length) > 0 and all($leaves[];
+        .kind == "fq_codel" and (.options|type) == "object" and
+        (.handle|test("^[0-9a-fA-F]+:$")) and
+        (.parent|type) == "string")) |
+      [$leaves[] | .parent |= (if $root == "0:" and startswith(":")
+        then "0" + . else . end)] as $normalized |
+      select(all($normalized[]; (.parent|startswith($root)) and
+        (.parent|ltrimstr($root)|test("^[0-9a-fA-F]+$")))) |
+      select(($normalized|map(.parent)|unique|length) == ($normalized|length)) |
+      {root:$root, leaves:($normalized|sort_by(.parent))}' <<< "$1"
+}
+
+# tc JSON times are microseconds. Reject unknown options before any mutation.
+pacing_codel_args() {
+    jq -er '
+      select(type == "object" and length > 0) |
+      to_entries | map(
+        if .key == "ecn" and (.value|type) == "boolean" then
+          [if .value then "ecn" else "noecn" end]
+        elif (.key as $k | ["limit","flows","quantum","memory_limit","drop_batch",
+              "target","interval","ce_threshold"] | index($k)) != null and
+             (.value|type) == "number" and .value >= 0 and .value == (.value|floor) then
+          [.key, ((.value|tostring) +
+            (if (.key == "target" or .key == "interval" or .key == "ce_threshold")
+             then "us" else "" end))]
+        else error("unsupported fq_codel option") end) | flatten[]' <<< "$1"
+}
+
+pacing_migrate_codel_mq() {
+    local iface="$1" data="$2" layout root root_hex backup after filters index
+    local parent minor handle options encoded i failed=0 touched=0 leaf
+    local -a parents=() handles=() commands=() args=()
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
+    layout=$(pacing_codel_layout "$data") || return 1
+    # No current rate state can legitimately describe fq_codel.
+    pacing_migration_preflight "$iface" '{"targets":[{"rate":4294967295}]}' || return 1
+    root=$(jq -r .root <<< "$layout")
+    root_hex=${root%:}
+    [[ "$root" != 0: ]] || root_hex=$(pacing_pick_mq_root_handle "$data") || return 1
+    index=$(pacing_ifindex "$iface") || return 1
+    mapfile -t parents < <(jq -r '.leaves[].parent' <<< "$layout")
+    # Check all affected attachment points, including leaf classifiers.
+    for parent in root "${parents[@]}"; do
+        if [[ "$parent" == root ]]; then
+            filters=$(tc -j filter show dev "$iface" root) || return 1
+        else
+            handle=$(jq -r --arg p "$parent" '.leaves[]|select(.parent==$p)|.handle' <<< "$layout")
+            filters=$(tc -j filter show dev "$iface" parent "$parent") || return 1
+            [[ "$filters" == '[]' ]] || { pacing_error "存在过滤器，拒绝转换 FQ_CoDel。"; return 1; }
+            if [[ "$handle" != 0: ]]; then
+                filters=$(tc -j filter show dev "$iface" parent "$handle") || return 1
+            fi
+        fi
+        [[ "$filters" == '[]' ]] || { pacing_error "存在过滤器，拒绝转换 FQ_CoDel。"; return 1; }
+    done
+    for parent in "${parents[@]}"; do
+        minor=${parent#*:}
+        handle=$(pacing_leaf_handle "$minor" "$root_hex") || return 1
+        jq -e --arg h "$handle" --arg p "$parent" 'all(.[]; .handle != $h or .parent == $p)' \
+            <<< "$data" >/dev/null || { pacing_error "迁移 handle 冲突。"; return 1; }
+        handles+=("$handle")
+        options=$(jq -ce --arg p "$parent" '.leaves[]|select(.parent==$p)|.options' <<< "$layout") || return 1
+        encoded=$(pacing_codel_args "$options") || { pacing_error "FQ_CoDel 参数不能安全重建，未修改队列。"; return 1; }
+        commands+=("$encoded")
+    done
+    backup="${PACING_CONFIG_FILE}.migration-${iface}-$(date +%s)-$$"
+    pacing_write_file "$backup" 600 "$data" || return 1
+    after=$(tc -j -d qdisc show dev "$iface") || return 1
+    [[ "$index" == "$(pacing_ifindex "$iface")" &&
+       $(jq -cS 'sort_by(.parent // "root")' <<< "$after") == \
+       "$(jq -cS 'sort_by(.parent // "root")' <<< "$data")" ]] || return 1
+    echo "正在把 $iface 的 mq + FQ_CoDel 转换为 mq + FQ（可能短暂丢包）；原参数：$backup"
+    if [[ "$root" == 0: ]]; then
+        tc qdisc replace dev "$iface" root handle "${root_hex}:" mq || return 1
+        touched=${#parents[@]}
+    fi
+    for ((i=0; i<${#parents[@]}; i++)); do
+        parent="${root_hex}:${parents[i]#*:}"
+        (( touched > i )) || touched=$((i + 1))
+        if ! tc qdisc replace dev "$iface" parent "$parent" handle "${handles[i]}" fq pacing; then
+            failed=1; break
+        fi
+    done
+    after=$(tc -j -d qdisc show dev "$iface") || failed=1
+    # Read back root, every leaf, pacing and unlimited initial rate.
+    [[ "$index" == "$(pacing_ifindex "$iface")" ]] || failed=1
+    jq -e --arg root "${root_hex}:" --argjson n "${#parents[@]}" '
+      length == ($n + 1) and any(.[]; .root == true and .kind == "mq" and .handle == $root)' \
+      <<< "$after" >/dev/null || failed=1
+    for ((i=0; i<${#parents[@]}; i++)); do
+        parent="${root_hex}:${parents[i]#*:}"
+        jq -e --arg p "$parent" --arg h "${handles[i]}" 'any(.[];
+          .parent == $p and .handle == $h and .kind == "fq" and
+          (.options|type) == "object" and .options.pacing != false and
+          (.options.maxrate // 4294967295) == 4294967295)' <<< "$after" >/dev/null || failed=1
+    done
+    if (( failed )); then
+        pacing_error "FQ_CoDel 转换未完成，正在尝试恢复原叶子参数。"
+        # Never delete mq or touch a recreated interface during rollback.
+        [[ "$index" == "$(pacing_ifindex "$iface")" &&
+           "$(pacing_mq_root_handle "$after")" == "${root_hex}:" ]] || {
+            pacing_error "网卡或根队列已变化，保留备份 $backup，请查看 [3]。"; return 1;
+        }
+        for ((i=0; i<touched; i++)); do
+            parent="${root_hex}:${parents[i]#*:}"
+            handle=$(jq -r --arg p "${parents[i]}" '.leaves[]|select(.parent==$p)|.handle' <<< "$layout")
+            [[ "$handle" != 0: ]] || handle=${handles[i]}
+            mapfile -t args < <(printf '%s\n' "${commands[i]}")
+            tc qdisc replace dev "$iface" parent "$parent" handle "$handle" fq_codel "${args[@]}" || \
+                pacing_error "$parent 回滚失败；请用 [3] 核对，备份 $backup。"
+            leaf=$(tc -j -d qdisc show dev "$iface") || leaf='[]'
+            options=$(jq -c --arg p "${parents[i]}" '.leaves[]|select(.parent==$p)|.options' <<< "$layout")
+            jq -e --arg p "$parent" --arg h "$handle" --argjson old "$options" '
+              any(.[]; .parent==$p and .handle==$h and .kind=="fq_codel" and
+                (.options as $actual | all($old|to_entries[];
+                  if .key=="target" or .key=="interval" or .key=="ce_threshold" then
+                    ($actual[.key] - .value | fabs) <= 1
+                  else $actual[.key] == .value end)))' <<< "$leaf" >/dev/null || \
+                pacing_error "$parent 回滚参数读回不符；请用 [3] 核对，备份 $backup。"
+        done
+        pacing_error "未应用限速；保留 mq 及可定址 handle。请用 [3] 核对后重试。"
+        return 1
+    fi
+    echo "已转换为 mq + FQ；关闭限速仅清除上限，不会切回 FQ_CoDel。"
+}
+
 pacing_is_partial_migrate() {
     jq -e '
       . as $all |
@@ -11709,14 +11844,16 @@ pacing_layout_addressable() {
 }
 
 pacing_wait_iface() {
-    local iface="$1" i
+    local iface="$1" i data
     local tries="${PACING_BOOT_RETRY_COUNT:-30}"
     local delay="${PACING_BOOT_RETRY_SLEEP:-2}"
     [[ "$tries" =~ ^[0-9]+$ ]] || tries=30
     [[ "$delay" =~ ^[0-9]+$ ]] || delay=2
     for ((i=0; i<tries; i++)); do
-        if [[ -e "/sys/class/net/$iface" ]] && pacing_read_layout "$iface" >/dev/null 2>&1; then
-            return 0
+        if [[ -e "/sys/class/net/$iface" ]]; then
+            if pacing_read_layout "$iface" >/dev/null 2>&1; then return 0; fi
+            data=$(tc -j -d qdisc show dev "$iface") || data='[]'
+            if pacing_codel_layout "$data" >/dev/null 2>&1; then return 0; fi
         fi
         (( i + 1 < tries )) || break
         sleep "$delay"
@@ -11810,6 +11947,10 @@ pacing_migrate_zero_mq() {
     local -a parents=() commands=() args=()
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     data=$(tc -j -d qdisc show dev "$iface") || return 1
+    if pacing_codel_layout "$data" >/dev/null 2>&1; then
+        pacing_migrate_codel_mq "$iface" "$data"
+        return $?
+    fi
     if pacing_is_partial_migrate "$data"; then
         pacing_migration_preflight "$iface" "$(pacing_read_layout "$iface")" || return 1
         pacing_migrate_mq_leaves "$iface" "$data"
@@ -11886,8 +12027,8 @@ pacing_migrate_zero_mq() {
 pacing_migrate_menu() {
     local answer
     pacing_pick_iface || return 1
-    echo "只在默认零 handle 的 mq + FQ 上需要迁移。根已是 FQ，或 mq 已可定址时请直接选 [1]。"
-    echo "将重建默认 mq + FQ 并备份参数；可能短暂丢包/中断，不能保证延迟不受影响。"
+    echo "支持零 handle mq + FQ 的迁移/修复，以及全部叶子为 FQ_CoDel 的 mq 转换为 FQ。"
+    echo "将备份参数并建立 mq + FQ；可能短暂丢包/中断。关闭限速不会切回 FQ_CoDel。"
     echo "成功后允许开机恢复时对该网卡同类默认队列再次迁移；不会设置 BBR 或 TCP 缓冲区。"
     read -r -p "确认迁移？[y/N]: " answer || return 1
     [[ "$answer" =~ ^[Yy]$ ]] || return 1
@@ -11908,7 +12049,15 @@ pacing_require_addressable() {
 
 pacing_ensure_addressable() {
     local iface="$1" data layout
-    layout=$(pacing_read_layout "$iface") || return 1
+    if ! layout=$(pacing_read_layout "$iface" 2>/dev/null); then
+        data=$(tc -j -d qdisc show dev "$iface") || return 1
+        if pacing_codel_layout "$data" >/dev/null 2>&1; then
+            pacing_migrate_codel_mq "$iface" "$data"
+            return $?
+        fi
+        pacing_read_layout "$iface" >/dev/null
+        return 1
+    fi
     if pacing_layout_addressable "$layout"; then
         return 0
     fi
@@ -12454,7 +12603,8 @@ pacing_enable_all() {
     pacing_input_rate || return 1
     if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_disable_all; return $?; fi
     echo "对所选网卡的出站 FQ 流设置每流上限（含 TCP/UDP，不是整卡总带宽，不管入站）。"
-    echo "不改 BBR / TCP 缓冲区。零 handle 的根 FQ 或 mq 叶子会自动迁移（可能短暂丢包）。"
+    echo "不改 BBR / TCP 缓冲区。零 handle FQ / mq 会自动迁移；mq 的全部 FQ_CoDel 叶子会转换为 FQ（可能短暂丢包）。"
+    echo "关闭限速仅恢复每流上限，不会切回 FQ_CoDel。混合叶子不自动转换。"
     echo "与菜单 36 的 CAKE 互斥；成功后会安装开机恢复。普通文件运行会安装当前这份；在线 curl 会再下载一份 GitHub main。"
     pacing_warn_qdisc_conflict
     pacing_pick_iface || return 1
@@ -12687,7 +12837,7 @@ manage_tcp_pacing_limit() {
         echo "FQ 每流限速管理（出站每流，含 TCP/UDP；不是整卡，不管入站）"
         echo "与菜单 36 CAKE 互斥。纯数字按 MiB/s（20 = 20M）。"
         pacing_status_summary
-        echo "1. 选择网卡并限速（零 handle FQ / mq 会自动迁移）"
+        echo "1. 选择网卡并限速（零 handle FQ / mq 自动迁移，mq + FQ_CoDel 自动转换）"
         echo "2. 修改速率（0 = 关闭所选网卡）"
         echo "3. 查看实际队列与 TCP 状态"
         echo "4. 关闭并恢复本版本修改前的上限"

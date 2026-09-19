@@ -101,6 +101,48 @@ if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
     pacing_locked pacing_disable
 fi
 
+# Real kernel-created mq + fq_codel, matching the AWS ens5 report.
+if [[ ${PACING_TEST_DEFAULT_CODEL:-0} == 1 ]]; then
+    ip link add pacingaws numtxqueues 2 type dummy
+    ip link set pacingaws up
+    data=$(tc -j -d qdisc show dev pacingaws)
+    if ! pacing_codel_layout "$data" >/dev/null; then
+        ip link del pacingaws
+        ip tuntap add dev pacingaws mode tap multi_queue
+        ip link set pacingaws up
+        data=$(tc -j -d qdisc show dev pacingaws)
+    fi
+    pacing_codel_layout "$data" >/dev/null
+    jq -e 'all(.[]; .handle == "0:")' <<< "$data" >/dev/null
+    # Fail the second FQ leaf once; verify the real rollback serializer.
+    tc() {
+        if [[ "$*" == 'qdisc replace dev pacingaws parent 7ffe:2 handle 7002: fq pacing' &&
+              ! -e "$work/failed" ]]; then
+            touch "$work/failed"; return 2
+        fi
+        command tc "$@"
+    }
+    if pacing_prepare_and_apply pacingaws 51200; then
+        echo 'Expected injected FQ conversion failure' >&2; exit 1
+    fi
+    unset -f tc
+    rolled=$(tc -j -d qdisc show dev pacingaws)
+    pacing_codel_layout "$rolled" >/dev/null
+    [[ ! -e "$PACING_CONFIG_FILE" ]]
+    # Retry from the addressed mq left by rollback.
+    pacing_locked pacing_prepare_and_apply pacingaws 51200
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingaws)") == 51200 ]]
+    pacing_locked pacing_disable
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingaws)") == 4294967295 ]]
+    # Simulated reboot: fresh automatic fq_codel leaves + persisted policy.
+    tc qdisc del dev pacingaws root
+    PACING_POLICY_FILE="$work/policy.json"
+    printf '%s\n' '{"version":1,"iface":"pacingaws","rate":51200}' > "$PACING_POLICY_FILE"
+    pacing_locked pacing_restore_boot
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingaws)") == 51200 ]]
+    pacing_locked pacing_disable
+fi
+
 # Explicit nonzero mq + FQ leaf layout.
 ip link add pacingmq numtxqueues 2 type veth peer name pacingpeer numtxqueues 2
 ip link set pacingmq up
