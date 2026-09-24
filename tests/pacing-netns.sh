@@ -101,10 +101,82 @@ if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then
     pacing_locked pacing_disable
 fi
 
+# Real kernel-created mq + fq_codel, matching the AWS ens5 report.
+if [[ ${PACING_TEST_DEFAULT_CODEL:-0} == 1 ]]; then
+    ip link add pacingaws numtxqueues 2 type dummy
+    ip link set pacingaws up
+    data=$(tc -j -d qdisc show dev pacingaws)
+    if ! pacing_codel_layout "$data" >/dev/null; then
+        ip link del pacingaws
+        ip tuntap add dev pacingaws mode tap multi_queue
+        ip link set pacingaws up
+        data=$(tc -j -d qdisc show dev pacingaws)
+    fi
+    pacing_codel_layout "$data" >/dev/null
+    jq -e 'all(.[]; .handle == "0:")' <<< "$data" >/dev/null
+    # TAP fallback can have one TX queue; fail its last leaf, not a guessed :2.
+    fail_minor=$(jq -r '[.[]|select(.parent!=null)|.parent|split(":")|last]|sort|last' <<< "$data")
+    tc() {
+        if [[ "${1:-} ${2:-} ${4:-} ${5:-} ${6:-} ${9:-}" == "qdisc replace pacingaws parent 7ffe:$fail_minor fq" &&
+              ! -e "$work/failed" ]]; then
+            touch "$work/failed"; return 2
+        fi
+        command tc "$@"
+    }
+    if pacing_prepare_and_apply pacingaws 51200; then
+        echo 'Expected injected FQ conversion failure' >&2; exit 1
+    fi
+    unset -f tc
+    rolled=$(tc -j -d qdisc show dev pacingaws)
+    pacing_codel_layout "$rolled" >/dev/null
+    jq -e --argjson old "$data" '
+      [.[]|select(.parent!=null)|.options] as $now |
+      [$old[]|select(.parent!=null)|.options] as $before |
+      ($now|length)==($before|length) and
+      all(range(0; $before|length); . as $i |
+        all($before[$i]|to_entries[];
+          if .key=="target" or .key=="interval" or .key=="ce_threshold" then
+            ($now[$i][.key] - .value | fabs) <= 1
+          else $now[$i][.key] == .value end))' <<< "$rolled" >/dev/null
+    [[ ! -e "$PACING_CONFIG_FILE" ]]
+    # Retry from the addressed mq left by rollback.
+    pacing_locked pacing_prepare_and_apply pacingaws 51200
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingaws)") == 51200 ]]
+    pacing_locked pacing_disable
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingaws)") == 4294967295 ]]
+    # Simulated reboot: fresh automatic fq_codel leaves + persisted policy.
+    tc qdisc del dev pacingaws root
+    PACING_POLICY_FILE="$work/policy.json"
+    printf '%s\n' '{"version":1,"iface":"pacingaws","rate":51200}' > "$PACING_POLICY_FILE"
+    pacing_locked pacing_restore_boot
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingaws)") == 51200 ]]
+    pacing_locked pacing_disable
+fi
+
 # Explicit nonzero mq + FQ leaf layout.
 ip link add pacingmq numtxqueues 2 type veth peer name pacingpeer numtxqueues 2
 ip link set pacingmq up
 tc qdisc replace dev pacingmq root handle 1: mq
+if [[ ${PACING_TEST_DEFAULT_CODEL:-0} == 1 ]]; then
+    data=$(tc -j -d qdisc show dev pacingmq)
+    pacing_codel_layout "$data" >/dev/null
+    [[ $(jq '[.[]|select(.parent!=null)]|length' <<< "$data") == 2 ]]
+    tc() {
+        if [[ "${1:-} ${2:-} ${4:-} ${5:-} ${6:-} ${9:-}" == 'qdisc replace pacingmq parent 1:2 fq' &&
+              ! -e "$work/failed-second" ]]; then
+            touch "$work/failed-second"; return 2
+        fi
+        command tc "$@"
+    }
+    if pacing_prepare_and_apply pacingmq 51200; then
+        echo 'Expected second-leaf conversion failure' >&2; exit 1
+    fi
+    unset -f tc
+    pacing_codel_layout "$(tc -j -d qdisc show dev pacingmq)" >/dev/null
+    pacing_locked pacing_prepare_and_apply pacingmq 51200
+    [[ $(pacing_layout_rate "$(pacing_read_layout pacingmq)") == 51200 ]]
+    pacing_locked pacing_disable
+fi
 # A normal mq root (outside the migration's 7fxx range) also has zero-handle
 # automatic leaves. Exercise option 1 before explicitly configuring the leaves.
 if [[ ${PACING_TEST_DEFAULT_FQ:-0} == 1 ]]; then

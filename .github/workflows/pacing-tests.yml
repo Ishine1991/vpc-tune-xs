@@ -8,7 +8,7 @@ on:
       - .gitattributes
       - .github/workflows/pacing-tests.yml
   push:
-    branches: [main, fix/option39-pacing-recovery, fix/option39-zero-handle, fix/option39-fq-mq-recovery]
+    branches: [main, fix/option39-pacing-recovery, fix/option39-zero-handle, fix/option39-fq-mq-recovery, fix/option39-aws-fq-codel]
     paths:
       - '**/*.sh'
       - tests/**
@@ -52,3 +52,10 @@ jobs:
           trap 'sudo sysctl -w net.core.default_qdisc="$old"' EXIT
           sudo sysctl -w net.core.default_qdisc=fq
           sudo env PACING_TEST_DEFAULT_FQ=1 bash tests/pacing-netns.sh
+      - name: Verify AWS mq plus fq_codel conversion and rollback
+        if: ${{ !cancelled() }}
+        run: |
+          old=$(sysctl -n net.core.default_qdisc)
+          trap 'sudo sysctl -w net.core.default_qdisc="$old"' EXIT
+          sudo sysctl -w net.core.default_qdisc=fq_codel
+          sudo env PACING_TEST_DEFAULT_CODEL=1 bash tests/pacing-netns.sh
