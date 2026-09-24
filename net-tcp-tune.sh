@@ -12347,7 +12347,7 @@ pacing_kernel_wizard() {
     [[ "$answer" == y || "$answer" == Y ]] || return 1
     pacing_kernel_stage_once "$kernel" "$entry" || return 1
     echo "已校验下次启动安排。本次输入的限速尚未生效，原限速策略未更改。"
-    echo "重启后请进入 39 → 2（首次设置用 1）重新设置；测试成功后再确认永久默认内核。"
+    echo "重启后请进入 39 → 2（首次设置用 1）重新设置；成功后会询问是否将当前内核设为永久默认。"
     echo "取消试启动可执行：grub-editenv /boot/grub/grubenv unset next_entry"
     read -r -p "是否立即重启？将断开 SSH 并中断业务 [y/N]: " answer || return 0
     if [[ "$answer" == y || "$answer" == Y ]]; then
@@ -12363,7 +12363,132 @@ pacing_apply_interactive() {
         # Never report the requested rate as applied just because boot was set.
         return 1
     fi
-    pacing_apply_persistent "$1" "$2" both
+    pacing_apply_persistent "$1" "$2" both || return 1
+    pacing_kernel_offer_default || echo "当前限速已生效；默认内核未确认，可稍后使用 39 → 8。"
+}
+
+pacing_grub_default_matches() {
+    local entry="$1" file="${2:-/boot/grub/grub.cfg}"
+    awk -v wanted="set default=\"$entry\"" '
+      /^[[:space:]]*set default=/ {
+        sub(/^[[:space:]]*/, ""); sub(/[[:space:]]*$/, "")
+        if ($0 == "set default=\"${next_entry}\"") next
+        count++; if ($0 == wanted) matched++
+      }
+      END { exit !(count == 1 && matched == 1) }
+    ' "$file"
+}
+
+pacing_has_verified_duplex() {
+    local items iface rate state layout
+    items=$(pacing_policy_items) || return 1
+    while IFS=$'\t' read -r iface rate; do
+        [[ -n "$iface" ]] || continue
+        state=$(pacing_rx_read "$iface") || continue
+        [[ $(jq -r .phase <<< "$state") == active && $(jq -r .rate <<< "$state") == "$rate" ]] || continue
+        pacing_rx_verify "$state" || continue
+        layout=$(pacing_read_layout "$iface") || continue
+        [[ $(pacing_layout_rate "$layout") == "$rate" ]] && return 0
+    done < <(jq -r '.[] | select(.ingress == true) | [.iface,(.rate|tostring)] | @tsv' <<< "$items")
+    return 1
+}
+
+# Only promote the kernel already running with a verified duplex policy.
+# Generate and validate a new grub.cfg before replacing the live boot menu.
+pacing_kernel_boot_files_ready() {
+    local kernel="$1" config
+    [[ "$kernel" =~ ^[a-zA-Z0-9_.+-]+$ && -s "/boot/vmlinuz-$kernel" &&
+       -s "/boot/initrd.img-$kernel" ]] || return 1
+    config=$(pacing_ifb_config "$kernel") || return 1
+    case "$config" in
+        CONFIG_IFB=y) return 0 ;;
+        CONFIG_IFB=m) pacing_kernel_tool modinfo -k "$kernel" ifb >/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+pacing_kernel_set_default() (
+    local kernel="$1" entry="$2" dropin=/etc/default/grub.d/zz-net-tcp-tune-default.cfg
+    local backup generated content rollback changed=0 committed=0
+    [[ "$kernel" == "$(uname -r)" ]] || return 1
+    pacing_kernel_boot_files_ready "$kernel" || {
+        pacing_error "当前内核的磁盘启动文件或 IFB 模块不完整，未修改默认内核。"; return 1;
+    }
+    pacing_has_verified_duplex || return 1
+    pacing_grub_preflight || return 1
+    [[ $(pacing_grub_entry "$kernel") == "$entry" ]] || return 1
+    [[ ! -L /boot/grub/grub.cfg && ! -L "$dropin" ]] || return 1
+    content=$(printf '# Managed by net-tcp-tune option 39\nGRUB_DEFAULT="%s"\n' "$entry")
+    if [[ -e "$dropin" ]]; then
+        [[ -f "$dropin" && $(wc -l < "$dropin") -eq 2 &&
+           $(head -n 1 "$dropin") == '# Managed by net-tcp-tune option 39' ]] &&
+        grep -Eq '^GRUB_DEFAULT="gnulinux-advanced-[a-zA-Z0-9-]+>gnulinux-[a-zA-Z0-9_.+-]+-advanced-[a-zA-Z0-9-]+"$' "$dropin" || {
+            pacing_error "默认内核配置文件已有其他内容，未覆盖: $dropin"; return 1;
+        }
+    fi
+    backup=$(mktemp -d /boot/grub/pacing-default-backup.XXXXXX) || return 1
+    cp -p -- /boot/grub/grub.cfg "$backup/grub.cfg" || return 1
+    if [[ -f "$dropin" ]]; then cp -p -- "$dropin" "$backup/previous-default.cfg" || return 1; fi
+    pacing_write_file "$backup/new-default.cfg" 644 "$content" || return 1
+    echo "默认内核设置备份: $backup（保留原 grub.cfg 和原覆盖配置，如存在）"
+    trap '
+        if ((changed && !committed)); then
+            if cmp -s -- "$dropin" "$backup/new-default.cfg"; then
+                if [[ -f "$backup/previous-default.cfg" ]]; then
+                    rollback=$(mktemp "${dropin}.rollback.XXXXXX") &&
+                    cp -p -- "$backup/previous-default.cfg" "$rollback" &&
+                    mv -f -- "$rollback" "$dropin" || pacing_error "恢复默认配置失败，请用备份人工恢复。"
+                else
+                    rm -- "$dropin" || pacing_error "撤销默认配置失败，请人工核对。"
+                fi
+            else
+                pacing_error "默认配置已变化，未覆盖，请人工核对备份。"
+            fi
+        fi
+    ' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    mkdir -p -- /etc/default/grub.d || return 1
+    changed=1
+    pacing_write_file "$dropin" 644 "$content" || return 1
+    generated="$backup/generated.cfg"
+    pacing_kernel_tool grub-mkconfig -o "$generated" || return 1
+    pacing_kernel_tool grub-script-check "$generated" || return 1
+    pacing_grub_default_matches "$entry" "$generated" &&
+    [[ $(pacing_grub_entry "$kernel" "$generated") == "$entry" ]] || {
+        pacing_error "生成的 GRUB 默认项未通过校验，未替换启动菜单。"; return 1;
+    }
+    # Refuse to overwrite another updater that ran while we generated the menu.
+    cmp -s -- /boot/grub/grub.cfg "$backup/grub.cfg" || return 1
+    cmp -s -- "$dropin" "$backup/new-default.cfg" || return 1
+    chmod --reference=/boot/grub/grub.cfg "$generated" || return 1
+    mv -f -- "$generated" /boot/grub/grub.cfg || return 1
+    committed=1
+    echo "已将当前内核 $kernel 设为永久默认；无需再次重启，旧内核仍保留。"
+    echo "默认固定到该版本；以后安装新内核不会自动选用，需验证后重新设置。"
+)
+
+pacing_kernel_offer_default() {
+    local kernel entry answer
+    pacing_kernel_can_prompt || return 0
+    pacing_has_verified_duplex || {
+        pacing_error "请先在 [1]/[2] 成功设置双向限速，再确认默认内核。"; return 1;
+    }
+    kernel=$(uname -r) || return 1
+    entry=$(pacing_grub_entry "$kernel") || {
+        pacing_error "无法识别当前内核的标准 GRUB 项，未修改默认内核。"; return 1;
+    }
+    if pacing_grub_default_matches "$entry"; then
+        echo "当前内核已是明确指定的默认启动项。"
+        return 0
+    fi
+    echo "当前 $kernel 已运行且双向限速校验通过。建议固定为默认，避免下次回到不支持 IFB 的内核。"
+    echo "会备份配置并更新 GRUB；不删除旧内核，不重启。以后新内核需验证后另行选择。"
+    read -r -p "确认业务/网络正常，并将当前内核设为永久默认？[y/N]: " answer || return 0
+    [[ "$answer" == y || "$answer" == Y ]] || {
+        echo "未更改默认内核；可稍后使用 39 → 8，重启前请确认默认内核支持 IFB。"; return 0;
+    }
+    pacing_kernel_set_default "$kernel" "$entry"
 }
 
 pacing_ifb_ready() {
@@ -13360,12 +13485,14 @@ manage_tcp_pacing_limit() {
         echo "5. 清理旧版限速及全局调优配置"
         echo "6. 删除上次启动的过期记录"
         echo "7. 手动迁移或修复半完成的 mq（选项 1 会自动做）"
+        echo "8. 将当前已验证双向限速的内核设为永久默认（无需重启）"
         echo "0. 返回"
         read -r -p "请选择: " choice || return
         case "$choice" in
             1) pacing_enable_all;; 2) pacing_modify_rate;; 3) pacing_view_realtime;;
             4) pacing_disable_all;; 5) pacing_locked pacing_legacy_cleanup;;
-            6) pacing_locked pacing_forget_stale;; 7) pacing_migrate_menu;; 0) return;; *) echo "无效选项";;
+            6) pacing_locked pacing_forget_stale;; 7) pacing_migrate_menu;;
+            8) pacing_locked pacing_kernel_offer_default;; 0) return;; *) echo "无效选项";;
         esac
         break_end
     done
