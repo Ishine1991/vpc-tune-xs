@@ -12161,7 +12161,9 @@ pacing_rx_identity() {
     }
     link=$(ip -j -d link show dev "$ifb") || return 1
     jq -e --argjson state "$state" 'length == 1 and
-      .[0].linkinfo.info_kind == "ifb" and .[0].ifalias == $state.owner and
+      .[0].linkinfo.info_kind == "ifb" and
+      (.[0].ifalias == $state.owner or
+        ($state.phase == "pending" and $state.ifb_index != null and (.[0].ifalias // "") == "")) and
       ($state.ifb_index == null or .[0].ifindex == $state.ifb_index)' <<< "$link" >/dev/null || {
         pacing_error "$ifb 不再是本功能创建的 IFB，停止操作。"; return 1;
     }
@@ -12185,7 +12187,7 @@ pacing_rx_verify() {
     iface=$(jq -r .iface <<< "$state"); ifb=$(jq -r .ifb <<< "$state")
     qdiscs=$(tc -j qdisc show dev "$iface") || return 1
     jq -e '[.[]|select(.kind == "ingress" or .kind == "clsact")] |
-      length == 1 and .[0].kind == "ingress" and .[0].handle == "f139:"' <<< "$qdiscs" >/dev/null || return 1
+      length == 1 and .[0].kind == "ingress" and .[0].handle == "ffff:"' <<< "$qdiscs" >/dev/null || return 1
     filters=$(tc -j filter show dev "$iface" ingress) || return 1
     pacing_rx_filters_match "$filters" "$ifb" || return 1
     root=$(pacing_read_root "$ifb") || return 1
@@ -12250,7 +12252,7 @@ pacing_rx_disable() {
             pacing_error "入站队列归属尚未确认，保留记录。"; return 1;
         }
         jq -e '[.[]|select(.kind == "ingress" or .kind == "clsact")] |
-          length == 1 and .[0].kind == "ingress" and .[0].handle == "f139:"' <<< "$qdiscs" >/dev/null || return 1
+          length == 1 and .[0].kind == "ingress" and .[0].handle == "ffff:"' <<< "$qdiscs" >/dev/null || return 1
         filters=$(tc -j filter show dev "$iface" ingress) || return 1
         # Empty is normal if creation or an earlier cleanup was interrupted.
         if ! jq -e 'length == 0' <<< "$filters" >/dev/null; then
@@ -12259,7 +12261,7 @@ pacing_rx_disable() {
             }
             tc filter del dev "$iface" ingress protocol all pref 49139 handle 1 matchall || return 1
         fi
-        tc qdisc del dev "$iface" handle f139: ingress || return 1
+        tc qdisc del dev "$iface" ingress || return 1
     fi
     if jq -e --arg ifb "$ifb" 'any(.[]; .ifname == $ifb)' <<< "$links" >/dev/null; then
         ip link del dev "$ifb" || return 1
@@ -12300,7 +12302,7 @@ pacing_rx_apply() {
       '{version:1,iface:$iface,ifindex:$index,boot:$boot,ifb:$ifb,owner:$owner,
         ifb_index:null,rate:$rate,phase:"pending",ingress_owned:false}') || return 1
     pacing_write_file "$file" 600 "$state" || return 1
-    if ! ip link add name "$ifb" alias "$owner" type ifb; then
+    if ! ip link add name "$ifb" type ifb; then
         pacing_error "无法创建 IFB；请检查内核 ifb 支持。出站上限尚未修改。"
         # No deletion on add failure: a concurrent creator could own the name.
         return 1
@@ -12310,12 +12312,13 @@ pacing_rx_apply() {
     pacing_write_file "$file" 600 "$state" || return 1
     # Full receive hash avoids FQ's default 1024 orphan buckets combining many
     # unrelated incoming connections; total queue limit still bounds memory.
-    if ! tc qdisc add dev "$ifb" root handle 139: fq orphan_mask 4294967295 maxrate "$((rate * 8))bit" ||
+    if ! ip link set dev "$ifb" alias "$owner" ||
+       ! tc qdisc add dev "$ifb" root handle 139: fq orphan_mask 4294967295 maxrate "$((rate * 8))bit" ||
        ! ip link set dev "$ifb" up; then
         pacing_rx_disable "$iface" || true
         return 1
     fi
-    if ! tc qdisc add dev "$iface" handle f139: ingress; then
+    if ! tc qdisc add dev "$iface" handle ffff: ingress; then
         pacing_rx_disable "$iface" || true
         return 1
     fi
