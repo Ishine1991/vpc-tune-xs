@@ -117,10 +117,86 @@ pacing_kernel_tool() {{
             'lsblk() { echo lvm; }',
             'findmnt() { echo btrfs; }',
         ):
-            self.assertNotEqual(self.run_shell('pacing_grub_preflight', self.setup + '\n' + override).returncode, 0)
+            result = self.run_shell('pacing_grub_preflight', self.setup + '\n' + override)
+            self.assertEqual(result.returncode, 10, result.stdout + result.stderr)
         self.cfg.write_text(self.cfg.read_text().replace('save_env next_entry', '# disabled'))
         self.assertNotEqual(self.run_shell('pacing_grub_preflight', self.setup).returncode, 0)
         self.assertEqual(self.events_text(), '')
+
+    def non_ext_setup(self):
+        return self.prompt_setup() + f'''
+TEST_CFG='{support.shell_path(self.cfg)}'
+TEST_DROPIN='{support.shell_path(self.base / 'defaults' / 'zz-net-tcp-tune-default.cfg')}'
+pacing_kernel_boot_files_ready() {{ return 0; }}
+eval "$(declare -f pacing_kernel_tool | sed '1s/pacing_kernel_tool/pacing_test_original_tool/')"
+pacing_kernel_tool() {{
+    if [[ "$1" == grub-mkconfig ]]; then
+        echo generate >> "$EVENTS"
+        [[ "${{GEN_FAIL:-0}}" != 1 ]] || return 1
+        command cat "$TEST_CFG" > "$3"
+        local entry
+        entry=$(sed -n 's/^GRUB_DEFAULT="\\(.*\\)"$/\\1/p' "$TEST_DROPIN")
+        printf '\\nset default="%s"\\n' "${{WRONG_DEFAULT:-$entry}}" >> "$3"
+    else
+        pacing_test_original_tool "$@"
+    fi
+}}
+findmnt() {{ case "$*" in *SOURCE*) echo /dev/vda1;; *FSTYPE*) echo xfs;; *) return 1;; esac; }}
+'''
+
+    def test_non_ext_sets_permanent_default_without_oneshot_or_rate(self):
+        original = self.cfg.read_bytes()
+        setup = self.non_ext_setup() + '''
+pacing_ifb_ready() { return 1; }
+pacing_apply_persistent() { echo apply-rate >> "$EVENTS"; }
+'''
+        result = self.run_shell("pacing_apply_interactive eth0 30720 <<< $'1\\ny\\nn'", setup)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('generate\n', self.events_text())
+        self.assertNotIn('stage', self.events_text())
+        self.assertNotIn('reboot', self.events_text())
+        self.assertNotIn('apply-rate', self.events_text())
+        self.assertNotEqual(self.cfg.read_bytes(), original)
+        dropin = self.base / 'defaults' / 'zz-net-tcp-tune-default.cfg'
+        self.assertIn('GRUB_DEFAULT="gnulinux-advanced-', dropin.read_text())
+
+    def test_non_ext_cancel_or_existing_entry_leaves_boot_unchanged(self):
+        original = self.cfg.read_bytes()
+        for answers in ('0', '1\\nn'):
+            self.events.write_text('') if self.events.exists() else None
+            self.run_shell("pacing_kernel_wizard <<< $'" + answers + "'", self.non_ext_setup())
+            self.assertNotIn('generate', self.events_text())
+            self.assertEqual(self.cfg.read_bytes(), original)
+        self.env.write_text('next_entry=some-other-task\n')
+        self.assertNotEqual(self.run_shell(
+            "pacing_kernel_wizard <<< $'1\\ny\\ny'", self.non_ext_setup()).returncode, 0)
+        self.assertNotIn('generate', self.events_text())
+        self.assertNotIn('reboot', self.events_text())
+        self.assertEqual(self.cfg.read_bytes(), original)
+
+    def test_non_ext_reboot_requires_second_yes_and_failed_generate_rolls_back(self):
+        self.ok("pacing_kernel_wizard <<< $'1\\ny\\ny'", self.non_ext_setup())
+        self.assertEqual(self.events_text(), 'generate\nreboot\n')
+        original = self.cfg.read_bytes()
+        dropin = self.base / 'defaults' / 'zz-net-tcp-tune-default.cfg'
+        dropin.unlink()
+        self.events.write_text('')
+        self.cfg.write_bytes(original)
+        self.assertNotEqual(self.run_shell(
+            "pacing_kernel_wizard <<< $'1\\ny\\ny'",
+            self.non_ext_setup() + '\nGEN_FAIL=1').returncode, 0)
+        self.assertEqual(self.cfg.read_bytes(), original)
+        self.assertFalse(dropin.exists())
+        self.assertNotIn('reboot', self.events_text())
+
+    def test_verified_default_does_not_require_ext_environment_block(self):
+        setup = self.default_setup() + '''
+findmnt() { echo xfs; }
+pacing_grub_preflight() { echo unexpected-preflight >> "$EVENTS"; return 1; }
+'''
+        self.ok(self.default_call(), setup)
+        self.assertNotIn('unexpected-preflight', self.events_text())
+        self.assertEqual(self.events_text(), 'generate\n')
 
     def test_ui_failure_does_not_apply_requested_rate(self):
         setup = self.prompt_setup() + '''

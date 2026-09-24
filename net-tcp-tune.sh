@@ -12271,32 +12271,51 @@ pacing_grub_entry() {
 pacing_kernel_can_prompt() { [[ $EUID -eq 0 && -t 0 && -t 1 ]]; }
 pacing_grub_env() { pacing_kernel_tool grub-editenv /boot/grub/grubenv "$@"; }
 
-pacing_grub_preflight() {
+pacing_grub_cfg_ready() {
+    [[ -f /boot/grub/grub.cfg && ! -L /boot/grub/grub.cfg ]] || {
+        pacing_error "未找到标准 GRUB 菜单，请人工切换内核。"; return 1;
+    }
+    pacing_kernel_tool grub-script-check /boot/grub/grub.cfg
+}
+
+# Return 0 when a one-time boot can be stored in the GRUB environment block.
+# Return 10 when the menu is usable but raw environment-block updates are not
+# safe; callers may offer a permanent default instead. Other failures return 1.
+pacing_grub_once_ready() {
     local source fs types env
-    [[ -f /boot/grub/grub.cfg && -f /boot/grub/grubenv && ! -L /boot/grub/grubenv ]] || {
-        pacing_error "未找到标准 GRUB 配置/环境块，请人工切换内核。"; return 1;
+    pacing_grub_cfg_ready || return 1
+    [[ -f /boot/grub/grubenv && ! -L /boot/grub/grubenv ]] || {
+        pacing_error "未找到标准 GRUB 环境块，请人工切换内核。"; return 1;
     }
     grep -Eq '^[[:space:]]*set default="\$\{next_entry\}"[[:space:]]*$' /boot/grub/grub.cfg &&
     grep -Eq '^[[:space:]]*save_env next_entry[[:space:]]*$' /boot/grub/grub.cfg || {
         pacing_error "GRUB 配置未确认支持一次性启动，请人工核对。"; return 1;
     }
-    pacing_kernel_tool grub-script-check /boot/grub/grub.cfg || return 1
-    source=$(findmnt -n -o SOURCE -T /boot/grub/grubenv) || return 1
-    fs=$(findmnt -n -o FSTYPE -T /boot/grub/grubenv) || return 1
-    [[ "$source" == /dev/* && "$fs" =~ ^ext[234]$ ]] || {
-        pacing_error "仅自动处理普通磁盘上的 ext2/3/4 GRUB 环境块；其他布局请人工核对。"; return 1;
-    }
-    types=$(lsblk -snro TYPE "$source") || return 1
-    [[ -n "$types" ]] && ! grep -qvE '^(disk|part)$' <<< "$types" || {
-        pacing_error "检测到 LVM/RAID/加密或未知磁盘布局，不自动安排试启动。"; return 1;
-    }
-    env=$(pacing_grub_env list) || return 1
-    if grep -qE '^next_entry=.+' <<< "$env"; then
-        pacing_error "已有下次启动安排，未覆盖；请先人工确认："
-        printf '%s\n' "$env"
-        return 1
+    source=$(findmnt -n -o SOURCE -T /boot/grub/grubenv) || source="未知"
+    fs=$(findmnt -n -o FSTYPE -T /boot/grub/grubenv) || fs="未知"
+    PACING_GRUB_SOURCE=$source
+    PACING_GRUB_FS=$fs
+    if [[ "$source" == /dev/* && "$fs" =~ ^ext[234]$ ]]; then
+        types=$(lsblk -snro TYPE "$source") || return 1
+        if [[ -z "$types" ]] || grep -qvE '^(disk|part)$' <<< "$types"; then
+            echo "检测到 LVM/RAID/加密或未知磁盘布局，不能安全做一次性试启动。"
+            echo "可以改为直接设置永久默认内核；启动失败需用救援入口恢复。"
+            return 10
+        fi
+        env=$(pacing_grub_env list) || return 1
+        if grep -qE '^next_entry=.+' <<< "$env"; then
+            pacing_error "已有下次启动安排，未覆盖；请先人工确认："
+            printf '%s\n' "$env"
+            return 1
+        fi
+        return 0
     fi
+    echo "当前 GRUB 环境块在 ${source}（文件系统 ${fs}）上，不能安全做一次性试启动。"
+    echo "可以改为直接设置永久默认内核；启动失败需用救援入口恢复。"
+    return 10
 }
+
+pacing_grub_preflight() { pacing_grub_once_ready; }
 
 pacing_kernel_stage_once() {
     local kernel="$1" entry="$2" actual backup env
@@ -12322,11 +12341,9 @@ pacing_kernel_stage_once() {
     return 1
 }
 
-pacing_kernel_wizard() {
-    local kernel entry choice answer i
+pacing_kernel_choose() {
+    local kernel entry choice i
     local -a kernels=() entries=()
-    pacing_kernel_can_prompt || return 1
-    pacing_grub_preflight || return 1
     while IFS= read -r kernel; do
         entry=$(pacing_grub_entry "$kernel") || continue
         kernels+=("$kernel"); entries+=("$entry")
@@ -12334,26 +12351,68 @@ pacing_kernel_wizard() {
     ((${#kernels[@]})) || {
         pacing_error "没有同时具备 IFB、启动文件和可识别 GRUB 菜单项的已安装内核。"; return 1;
     }
-    echo "可选择以下 IFB 内核进行下一次试启动（不保证启动/网络正常）："
     for i in "${!kernels[@]}"; do printf '  %d. %s\n' "$((i + 1))" "${kernels[i]}"; done
     echo "  0. 取消，保持现状"
     read -r -p "选择内核编号 [默认取消]: " choice || return 1
     [[ "$choice" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
     ((10#$choice <= ${#kernels[@]})) || return 1
-    i=$((10#$choice - 1)); kernel=${kernels[i]}; entry=${entries[i]}
-    echo "仅安排下一次启动 $kernel；不删除旧内核，不更改永久默认内核。"
-    echo "重启会中断 SSH 和业务；启动失败不会自动重启救援。请确保云平台控制台/救援入口可用。"
-    read -r -p "确认已有救援入口，并同意设置这次试启动？[y/N]: " answer || return 1
+    i=$((10#$choice - 1))
+    PACING_CHOSEN_KERNEL=${kernels[i]}
+    PACING_CHOSEN_ENTRY=${entries[i]}
+}
+
+pacing_kernel_wizard() {
+    local kernel entry answer once_rc=0 env
+    pacing_kernel_can_prompt || return 1
+    pacing_grub_cfg_ready || return 1
+    pacing_grub_once_ready || once_rc=$?
+    ((once_rc == 0 || once_rc == 10)) || return 1
+    if ((once_rc == 0)); then
+        echo "可选择以下 IFB 内核进行下一次试启动（不保证启动/网络正常）："
+    else
+        echo "可选择以下 IFB 内核设为永久默认（当前磁盘不能做一次性试启动）："
+    fi
+    pacing_kernel_choose || return 1
+    kernel=$PACING_CHOSEN_KERNEL
+    entry=$PACING_CHOSEN_ENTRY
+    if ((once_rc == 0)); then
+        echo "仅安排下一次启动 $kernel；不删除旧内核，不更改永久默认内核。"
+        echo "重启会中断 SSH 和业务；启动失败不会自动重启救援。请确保云平台控制台/救援入口可用。"
+        read -r -p "确认已有救援入口，并同意设置这次试启动？[y/N]: " answer || return 1
+        [[ "$answer" == y || "$answer" == Y ]] || return 1
+        pacing_kernel_stage_once "$kernel" "$entry" || return 1
+        echo "已校验下次启动安排。本次输入的限速尚未生效，原限速策略未更改。"
+        echo "重启后请进入 39 → 2（首次设置用 1）重新设置；成功后会询问是否将当前内核设为永久默认。"
+        echo "取消试启动可执行：grub-editenv /boot/grub/grubenv unset next_entry"
+        read -r -p "是否立即重启？将断开 SSH 并中断业务 [y/N]: " answer || return 0
+        if [[ "$answer" == y || "$answer" == Y ]]; then
+            pacing_kernel_tool reboot || { pacing_error "重启命令失败；下次启动安排仍保留。"; return 1; }
+        else
+            echo "未重启；下次自行重启时会使用所选内核。"
+        fi
+        return 0
+    fi
+    if [[ -f /boot/grub/grubenv && ! -L /boot/grub/grubenv ]] &&
+       env=$(pacing_grub_env list 2>/dev/null) && grep -qE '^next_entry=.+' <<< "$env"; then
+        pacing_error "已有下次启动安排，未修改永久默认；请先人工确认："
+        printf '%s\n' "$env"
+        return 1
+    fi
+    echo "将把 $kernel 设为永久默认，不是只生效一次。"
+    echo "若该内核无法启动或没有网络，重启后不会自动回到旧内核，需要用云平台救援入口恢复备份。"
+    echo "不删除旧内核，也不把本次输入的限速记为已生效。"
+    read -r -p "确认已有救援入口，并同意修改永久默认内核？[y/N]: " answer || return 1
     [[ "$answer" == y || "$answer" == Y ]] || return 1
-    pacing_kernel_stage_once "$kernel" "$entry" || return 1
-    echo "已校验下次启动安排。本次输入的限速尚未生效，原限速策略未更改。"
-    echo "重启后请进入 39 → 2（首次设置用 1）重新设置；成功后会询问是否将当前内核设为永久默认。"
-    echo "取消试启动可执行：grub-editenv /boot/grub/grubenv unset next_entry"
+    pacing_kernel_boot_files_ready "$kernel" || {
+        pacing_error "所选内核的启动文件或 IFB 模块不完整，未修改默认内核。"; return 1;
+    }
+    pacing_kernel_write_default "$kernel" "$entry" unverified || return 1
+    echo "重启后请进入 39 → 1 或 2 重新设置双向限速；成功后会在该内核上保持。"
     read -r -p "是否立即重启？将断开 SSH 并中断业务 [y/N]: " answer || return 0
     if [[ "$answer" == y || "$answer" == Y ]]; then
-        pacing_kernel_tool reboot || { pacing_error "重启命令失败；下次启动安排仍保留。"; return 1; }
+        pacing_kernel_tool reboot || { pacing_error "重启命令失败；永久默认已经更改。"; return 1; }
     else
-        echo "未重启；下次自行重启时会使用所选内核。"
+        echo "未重启。下次重启会进入 $kernel。"
     fi
 }
 
@@ -12393,8 +12452,6 @@ pacing_has_verified_duplex() {
     return 1
 }
 
-# Only promote the kernel already running with a verified duplex policy.
-# Generate and validate a new grub.cfg before replacing the live boot menu.
 pacing_kernel_boot_files_ready() {
     local kernel="$1" config
     [[ "$kernel" =~ ^[a-zA-Z0-9_.+-]+$ && -s "/boot/vmlinuz-$kernel" &&
@@ -12407,15 +12464,14 @@ pacing_kernel_boot_files_ready() {
     esac
 }
 
-pacing_kernel_set_default() (
-    local kernel="$1" entry="$2" dropin=/etc/default/grub.d/zz-net-tcp-tune-default.cfg
+# mode=verified: the kernel is already running and duplex pacing checked out.
+# mode=unverified: one-time boot is unavailable, so the chosen kernel becomes
+# the permanent default before it has been booted. Caller must confirm rescue.
+pacing_kernel_write_default() (
+    local kernel="$1" entry="$2" mode="$3" dropin=/etc/default/grub.d/zz-net-tcp-tune-default.cfg
     local backup generated content rollback changed=0 committed=0
-    [[ "$kernel" == "$(uname -r)" ]] || return 1
-    pacing_kernel_boot_files_ready "$kernel" || {
-        pacing_error "当前内核的磁盘启动文件或 IFB 模块不完整，未修改默认内核。"; return 1;
-    }
-    pacing_has_verified_duplex || return 1
-    pacing_grub_preflight || return 1
+    [[ "$mode" == verified || "$mode" == unverified ]] || return 1
+    pacing_grub_cfg_ready || return 1
     [[ $(pacing_grub_entry "$kernel") == "$entry" ]] || return 1
     [[ ! -L /boot/grub/grub.cfg && ! -L "$dropin" ]] || return 1
     content=$(printf '# Managed by net-tcp-tune option 39\nGRUB_DEFAULT="%s"\n' "$entry")
@@ -12464,9 +12520,24 @@ pacing_kernel_set_default() (
     chmod --reference=/boot/grub/grub.cfg "$generated" || return 1
     mv -f -- "$generated" /boot/grub/grub.cfg || return 1
     committed=1
-    echo "已将当前内核 $kernel 设为永久默认；无需再次重启，旧内核仍保留。"
-    echo "默认固定到该版本；以后安装新内核不会自动选用，需验证后重新设置。"
+    if [[ "$mode" == unverified ]]; then
+        echo "已将 $kernel 设为永久默认。该内核尚未验证能否启动和上网。"
+        echo "若重启后进不了系统，用救援入口将 $backup/grub.cfg 覆盖回 /boot/grub/grub.cfg，并删除 $dropin。"
+    else
+        echo "已将当前内核 $kernel 设为永久默认；无需再次重启，旧内核仍保留。"
+    fi
+    echo "默认固定到该版本；以后安装新内核不会自动选用，需验证后重新设置。旧内核仍保留。"
 )
+
+pacing_kernel_set_default() {
+    local kernel="$1" entry="$2"
+    [[ "$kernel" == "$(uname -r)" ]] || return 1
+    pacing_kernel_boot_files_ready "$kernel" || {
+        pacing_error "当前内核的磁盘启动文件或 IFB 模块不完整，未修改默认内核。"; return 1;
+    }
+    pacing_has_verified_duplex || return 1
+    pacing_kernel_write_default "$kernel" "$entry" verified
+}
 
 pacing_kernel_offer_default() {
     local kernel entry answer
