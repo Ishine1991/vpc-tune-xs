@@ -7205,7 +7205,7 @@ show_main_menu() {
     echo "38. AI代理工具箱 ▶ (Claude/WebUI/CRS/Fuclaude/Caddy) ⭐ 推荐"
     echo ""
     echo -e "${gl_kjlan}━━━━━━━━━━ 流量整形 ━━━━━━━━━━${gl_bai}"
-    echo "39. FQ每流限速（出站每流含UDP，不是整卡；零handle mq会自动迁移）"
+    echo "39. FQ双向每流限速（入站/出站含UDP；零handle会自动迁移）"
     echo ""
     echo -e "${gl_hong}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${gl_bai}"
     echo -e "${gl_hong}99. 完全卸载脚本（卸载所有内容）${gl_bai}"
@@ -11483,7 +11483,8 @@ pacing_human_rate() {
 
 pacing_input_rate() {
     local input confirm
-    echo "出站每流上限（含 TCP/UDP，不是整卡总带宽，不管入站）。"
+    echo "双向每流上限：所选网卡入站、出站各使用该上限（含 TCP/UDP）。"
+    echo "多个连接可各自使用上限；限速会产生排队，不能保证零延迟影响。"
     echo "单位：纯数字或 M = MiB/s，K = KiB/s，G = GiB/s。0 = 关闭本功能。"
     echo "例如 20 或 20M = 20 MiB/s；20K = 20 KiB/s。"
     read -r -p "每流上限（例如 20；回车取消）: " input || return 1
@@ -11505,7 +11506,7 @@ pacing_pick_iface() {
     while IFS= read -r line; do
         read -r name state _ <<< "$line"
         name=${name%%@*}
-        [[ -n "$name" && "$name" != lo && "$name" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]] || continue
+        [[ -n "$name" && "$name" != lo && "$name" != ntifb* && "$name" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]] || continue
         [[ "$name" =~ ^(sit|ip6tnl|ip6gre|gre|erspan|teql|dummy)[0-9]*$ ]] && continue
         ifaces+=("$name")
         states+=("${state:-UNKNOWN}")
@@ -11970,6 +11971,223 @@ pacing_migrate_zero_fq() {
     pacing_fq_options_match "$(jq -c .options <<< "$after")" "$options" || return 1
 }
 
+# Ingress uses a private IFB. Records live below a subdirectory so legacy
+# egress-state scans cannot mistake them for egress records.
+pacing_rx_file() { printf '%s/ingress/%s.json\n' "$PACING_STATE_DIR" "$1"; }
+
+pacing_rx_read() {
+    jq -ce 'select(.version == 1 and
+      (.iface|test("^[a-zA-Z0-9_.:-]{1,15}$")) and
+      (.ifindex|test("^[0-9]+$")) and (.ifb|test("^ntifb[0-9]+$")) and
+      (.boot|type == "string" and length > 0) and
+      (.owner|type == "string" and startswith("net-tcp-tune:")) and
+      (.ifb_index == null or (.ifb_index|type == "number" and . > 0)) and
+      (.rate|type == "number" and . > 0 and . < 4294967295 and . == floor) and
+      (.previous_rate == null or (.previous_rate|type == "number" and . > 0 and . < 4294967295 and . == floor)) and
+      (.phase == "pending" or .phase == "active") and
+      (.ingress_owned|type == "boolean"))' "$(pacing_rx_file "$1")" 2>/dev/null
+}
+
+pacing_rx_identity() {
+    local state="$1" iface ifb link
+    iface=$(jq -r .iface <<< "$state"); ifb=$(jq -r .ifb <<< "$state")
+    [[ $(pacing_boot_id) == "$(jq -r .boot <<< "$state")" &&
+       $(pacing_ifindex "$iface") == "$(jq -r .ifindex <<< "$state")" ]] || {
+        pacing_error "$iface 已重建或记录跨启动，未操作入站队列。"; return 1;
+    }
+    link=$(ip -j -d link show dev "$ifb") || return 1
+    jq -e --argjson state "$state" 'length == 1 and
+      .[0].linkinfo.info_kind == "ifb" and .[0].ifalias == $state.owner and
+      ($state.ifb_index == null or .[0].ifindex == $state.ifb_index)' <<< "$link" >/dev/null || {
+        pacing_error "$ifb 不再是本功能创建的 IFB，停止操作。"; return 1;
+    }
+}
+
+pacing_rx_filters_match() {
+    jq -e --arg ifb "$2" '
+      length > 0 and
+      all(.[]; .kind == "matchall" and .protocol == "all" and
+        .pref == 49139 and (.chain // 0) == 0) and
+      ([.[]|select(.options != null)] | length == 1 and
+        .[0].options.handle == 1 and
+        (.[0].options.actions | length == 1 and
+          .[0].kind == "mirred" and .[0].to_dev == $ifb and
+          .[0].direction == "egress" and .[0].mirred_action == "redirect"))' <<< "$1" >/dev/null
+}
+
+pacing_rx_verify() {
+    local state="$1" iface ifb qdiscs filters root
+    pacing_rx_identity "$state" || return 1
+    iface=$(jq -r .iface <<< "$state"); ifb=$(jq -r .ifb <<< "$state")
+    qdiscs=$(tc -j qdisc show dev "$iface") || return 1
+    jq -e '[.[]|select(.kind == "ingress" or .kind == "clsact")] |
+      length == 1 and .[0].kind == "ingress" and .[0].handle == "f139:"' <<< "$qdiscs" >/dev/null || return 1
+    filters=$(tc -j filter show dev "$iface" ingress) || return 1
+    pacing_rx_filters_match "$filters" "$ifb" || return 1
+    root=$(pacing_read_root "$ifb") || return 1
+    jq -e --argjson rate "$(jq -r .rate <<< "$state")" '
+      .kind == "fq" and .handle == "139:" and .options.pacing != false and
+      .options.maxrate == $rate and .options.orphan_mask == 4294967295' <<< "$root" >/dev/null
+}
+
+pacing_rx_preflight() {
+    local iface="$1" state qdiscs index links
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
+    if [[ -e "$(pacing_rx_file "$iface")" ]]; then
+        state=$(pacing_rx_read "$iface") || { pacing_error "入站记录损坏，未修改网络。"; return 1; }
+        [[ $(jq -r .phase <<< "$state") == active ]] && pacing_rx_verify "$state" || {
+            pacing_error "$iface 入站操作未完成或规则已变化，请用 [3] 检查并用 [4] 关闭。"; return 1;
+        }
+        return 0
+    fi
+    links=$(ip -j -d link show dev "$iface") || return 1
+    jq -e 'length == 1 and .[0].linkinfo.info_kind != "ifb"' <<< "$links" >/dev/null || return 1
+    qdiscs=$(tc -j qdisc show dev "$iface") || return 1
+    jq -e 'all(.[]; .kind != "ingress" and .kind != "clsact")' <<< "$qdiscs" >/dev/null || {
+        pacing_error "$iface 已有其他 ingress/clsact 规则，不能自动启用双向限速。"; return 1;
+    }
+    index=$(pacing_ifindex "$iface") || return 1
+    [[ "$index" =~ ^[0-9]{1,10}$ ]] || return 1
+    links=$(ip -j link show) || return 1
+    jq -e --arg name "ntifb$index" 'all(.[]; .ifname != $name)' <<< "$links" >/dev/null || {
+        pacing_error "IFB 名称 ntifb$index 已被占用，未修改网络。"; return 1;
+    }
+}
+
+# Disconnect ingress before deleting IFB: deleting a live redirect target first
+# would drop incoming packets. Never remove a foreign filter or shared clsact.
+pacing_rx_disable() {
+    local iface="$1" file state ifb qdiscs filters root links
+    file=$(pacing_rx_file "$iface")
+    [[ -e "$file" ]] || return 0
+    state=$(pacing_rx_read "$iface") || { pacing_error "入站恢复记录损坏: $file"; return 1; }
+    if [[ $(jq -r .boot <<< "$state") != "$(pacing_boot_id)" ]]; then
+        rm -- "$file" || return 1
+        return 0
+    fi
+    [[ $(pacing_ifindex "$iface") == "$(jq -r .ifindex <<< "$state")" ]] || {
+        pacing_error "$iface 已重建，保留入站恢复记录。"; return 1;
+    }
+    ifb=$(jq -r .ifb <<< "$state")
+    links=$(ip -j link show) || return 1
+    if jq -e --arg ifb "$ifb" 'any(.[]; .ifname == $ifb)' <<< "$links" >/dev/null; then
+        pacing_rx_identity "$state" || return 1
+        root=$(pacing_read_root "$ifb") || return 1
+        jq -e --argjson state "$state" '
+          (.kind == "noqueue" and $state.phase == "pending") or
+          (.kind == "fq" and .handle == "139:" and
+            (.options.maxrate == $state.rate or .options.maxrate == $state.previous_rate))' <<< "$root" >/dev/null || {
+            pacing_error "$ifb 队列被外部修改，保留记录。"; return 1;
+        }
+    fi
+    qdiscs=$(tc -j qdisc show dev "$iface") || return 1
+    if jq -e 'any(.[]; .kind == "ingress" or .kind == "clsact")' <<< "$qdiscs" >/dev/null; then
+        [[ $(jq -r .ingress_owned <<< "$state") == true ]] || {
+            pacing_error "入站队列归属尚未确认，保留记录。"; return 1;
+        }
+        jq -e '[.[]|select(.kind == "ingress" or .kind == "clsact")] |
+          length == 1 and .[0].kind == "ingress" and .[0].handle == "f139:"' <<< "$qdiscs" >/dev/null || return 1
+        filters=$(tc -j filter show dev "$iface" ingress) || return 1
+        # Empty is normal if creation or an earlier cleanup was interrupted.
+        if ! jq -e 'length == 0' <<< "$filters" >/dev/null; then
+            pacing_rx_filters_match "$filters" "$ifb" || {
+                pacing_error "$iface 入站过滤器已被外部修改，未删除。"; return 1;
+            }
+            tc filter del dev "$iface" ingress protocol all pref 49139 handle 1 matchall || return 1
+        fi
+        tc qdisc del dev "$iface" handle f139: ingress || return 1
+    fi
+    if jq -e --arg ifb "$ifb" 'any(.[]; .ifname == $ifb)' <<< "$links" >/dev/null; then
+        ip link del dev "$ifb" || return 1
+    fi
+    rm -- "$file" || return 1
+    echo "已关闭 $iface 入站限速，并清理本功能的 IFB。"
+}
+
+pacing_rx_apply() {
+    local iface="$1" rate="$2" file state old="" index boot ifb owner link pending
+    pacing_valid_rate "$rate" && ((rate > 0 && rate < 4294967295)) || return 1
+    pacing_rx_preflight "$iface" || return 1
+    file=$(pacing_rx_file "$iface")
+    if [[ -f "$file" ]]; then
+        old=$(pacing_rx_read "$iface") || return 1
+        ifb=$(jq -r .ifb <<< "$old")
+        pending=$(jq -c --argjson rate "$rate" '.previous_rate=.rate | .rate=$rate | .phase="pending"' <<< "$old") || return 1
+        pacing_write_file "$file" 600 "$pending" || return 1
+        if tc qdisc change dev "$ifb" root handle 139: fq maxrate "$((rate * 8))bit" &&
+           pacing_rx_verify "$pending" &&
+           pacing_write_file "$file" 600 "$(jq -c '.phase="active" | del(.previous_rate)' <<< "$pending")"; then
+            return 0
+        fi
+        if tc qdisc change dev "$ifb" root handle 139: fq maxrate "$(( $(jq -r .rate <<< "$old") * 8 ))bit" &&
+           pacing_rx_verify "$old"; then
+            pacing_write_file "$file" 600 "$old" || return 1
+        fi
+        pacing_error "入站修改失败，请查看 [3]；恢复记录已保留。"
+        return 1
+    fi
+    index=$(pacing_ifindex "$iface") || return 1
+    boot=$(pacing_boot_id) && [[ -n "$boot" ]] || return 1
+    ifb="ntifb$index"
+    owner="net-tcp-tune:ingress:$iface:$index:$boot"
+    mkdir -p -- "$(dirname -- "$file")" || return 1
+    state=$(jq -cn --arg iface "$iface" --arg index "$index" --arg boot "$boot" \
+      --arg ifb "$ifb" --arg owner "$owner" --argjson rate "$rate" \
+      '{version:1,iface:$iface,ifindex:$index,boot:$boot,ifb:$ifb,owner:$owner,
+        ifb_index:null,rate:$rate,phase:"pending",ingress_owned:false}') || return 1
+    pacing_write_file "$file" 600 "$state" || return 1
+    if ! ip link add name "$ifb" alias "$owner" type ifb; then
+        pacing_error "无法创建 IFB；请检查内核 ifb 支持。出站上限尚未修改。"
+        # No deletion on add failure: a concurrent creator could own the name.
+        return 1
+    fi
+    link=$(ip -j -d link show dev "$ifb") || return 1
+    state=$(jq -c --argjson index "$(jq -er '.[0].ifindex' <<< "$link")" '.ifb_index=$index' <<< "$state") || return 1
+    pacing_write_file "$file" 600 "$state" || return 1
+    # Full receive hash avoids FQ's default 1024 orphan buckets combining many
+    # unrelated incoming connections; total queue limit still bounds memory.
+    if ! tc qdisc add dev "$ifb" root handle 139: fq orphan_mask 4294967295 maxrate "$((rate * 8))bit" ||
+       ! ip link set dev "$ifb" up; then
+        pacing_rx_disable "$iface" || true
+        return 1
+    fi
+    if ! tc qdisc add dev "$iface" handle f139: ingress; then
+        pacing_rx_disable "$iface" || true
+        return 1
+    fi
+    state=$(jq -c '.ingress_owned=true' <<< "$state") || return 1
+    pacing_write_file "$file" 600 "$state" || return 1
+    if tc filter add dev "$iface" ingress protocol all pref 49139 handle 1 \
+         matchall skip_hw action mirred egress redirect dev "$ifb" &&
+       pacing_rx_verify "$state" &&
+       pacing_write_file "$file" 600 "$(jq -c '.phase="active"' <<< "$state")"; then
+        return 0
+    fi
+    pacing_error "入站限速未完成，正在清理本次添加的队列。"
+    pacing_rx_disable "$iface" || pacing_error "清理未完成，请使用 [3] 检查，[4] 重试清理。"
+    return 1
+}
+
+pacing_apply_duplex() {
+    local iface="$1" rate="$2" old_rx=""
+    pacing_rx_preflight "$iface" || return 1
+    # Migration checks must run before installing ingress on the same device.
+    pacing_ensure_addressable "$iface" || return 1
+    if [[ -f "$(pacing_rx_file "$iface")" ]]; then old_rx=$(pacing_rx_read "$iface") || return 1; fi
+    pacing_rx_apply "$iface" "$rate" || return 1
+    if pacing_apply_rate "$iface" "$rate"; then
+        echo "已验证 $iface 双向每流上限：入站、出站各 $(pacing_human_rate "$rate")"
+        return 0
+    fi
+    if [[ -n "$old_rx" ]]; then
+        pacing_rx_apply "$iface" "$(jq -r .rate <<< "$old_rx")" ||
+            pacing_error "出站失败且入站恢复失败，请查看 [3]。"
+    else
+        pacing_rx_disable "$iface" || pacing_error "出站失败且入站清理失败，请查看 [3]。"
+    fi
+    return 1
+}
+
 pacing_prepare_and_apply() {
     pacing_ensure_addressable "$1" || return 1
     pacing_apply_rate "$1" "$2"
@@ -12124,10 +12342,12 @@ pacing_read_policy() {
     jq -ce 'select(
         (.version == 1 and (.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and
          .iface != "lo" and (.rate | type == "number" and . > 0 and
-         . < 4294967295 and . == floor)) or
+         . < 4294967295 and . == floor) and
+         ((has("ingress")|not) or (.ingress|type == "boolean"))) or
         (.version == 2 and (.items | type == "array" and length > 0 and
          all(.[]; (.iface | test("^[a-zA-Z0-9_.:-]{1,15}$")) and .iface != "lo" and
-             (.rate | type == "number" and . > 0 and . < 4294967295 and . == floor))))
+             (.rate | type == "number" and . > 0 and . < 4294967295 and . == floor) and
+             ((has("ingress")|not) or (.ingress|type == "boolean")))))
       )' "$PACING_POLICY_FILE" 2>/dev/null
 }
 
@@ -12135,7 +12355,7 @@ pacing_policy_items() {
     local policy="${1:-}"
     [[ -n "$policy" ]] || policy=$(pacing_read_policy) || return 1
     jq -ce '
-      if .version == 1 then [{iface:.iface,rate:.rate}]
+      if .version == 1 then [({iface:.iface,rate:.rate} + (if .ingress == true then {ingress:true} else {} end))]
       else [.items[]] end' <<< "$policy"
 }
 
@@ -12173,7 +12393,7 @@ pacing_install_running_script() {
 }
 
 pacing_enable_autostart() {
-    local iface="$1" rate="$2" policy unit existing
+    local iface="$1" rate="$2" direction="${3:-egress}" policy unit existing
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
     pacing_valid_rate "$rate" && ((rate > 0 && rate < 4294967295)) || return 1
     command -v systemctl >/dev/null || { pacing_error "未找到 systemctl，无法设置开机恢复。"; return 1; }
@@ -12201,15 +12421,16 @@ WantedBy=multi-user.target'
     systemctl daemon-reload || return 1
     systemctl enable net-tcp-tune-pacing.service || return 1
     if existing=$(pacing_read_policy 2>/dev/null); then
-        policy=$(jq -cn --argjson existing "$existing" --arg iface "$iface" --argjson rate "$rate" '
-            (if $existing.version == 1 then [{iface:$existing.iface,rate:$existing.rate}]
+        policy=$(jq -cn --argjson existing "$existing" --arg iface "$iface" --argjson rate "$rate" --arg direction "$direction" '
+            (if $existing.version == 1 then [($existing | del(.version))]
              else $existing.items end)
-            | map(select(.iface != $iface)) + [{iface:$iface,rate:$rate}]
-            | if length == 1 then {version:1,iface:.[0].iface,rate:.[0].rate}
+            | map(select(.iface != $iface)) + [({iface:$iface,rate:$rate} +
+                (if $direction == "both" then {ingress:true} else {} end))]
+            | if length == 1 then (.[0] + {version:1})
               else {version:2,items:.} end') || return 1
     else
-        policy=$(jq -cn --arg iface "$iface" --argjson rate "$rate" \
-            '{version:1,iface:$iface,rate:$rate}') || return 1
+        policy=$(jq -cn --arg iface "$iface" --argjson rate "$rate" --arg direction "$direction" \
+            '{version:1,iface:$iface,rate:$rate} + (if $direction == "both" then {ingress:true} else {} end)') || return 1
     fi
     pacing_write_file "$PACING_POLICY_FILE" 600 "$policy" || return 1
     echo "已启用开机自动恢复限速。"
@@ -12352,7 +12573,7 @@ pacing_disable() {
 
 # systemd 仅根据独立策略文件恢复；旧启动记录必须验证为过期后才会替换。
 pacing_restore_boot() {
-    local policy items boot state file iface rate rc=0
+    local policy items boot state file iface rate ingress rc=0
     policy=$(pacing_read_policy) || { pacing_error "开机恢复策略不存在或已损坏。"; return 1; }
     items=$(pacing_policy_items "$policy") || return 1
     boot=$(pacing_boot_id) && [[ -n "$boot" ]] || return 1
@@ -12373,16 +12594,26 @@ pacing_restore_boot() {
         done
     fi
 
-    while IFS=$'\t' read -r iface rate; do
+    while IFS=$'\t' read -r iface rate ingress; do
         [[ -n "$iface" ]] || continue
         pacing_wait_iface "$iface" || { rc=1; continue; }
-        pacing_ensure_addressable "$iface" || { rc=1; continue; }
-        if pacing_apply_rate "$iface" "$rate"; then
+        if [[ "$ingress" == true ]]; then
+            file=$(pacing_rx_file "$iface")
+            if [[ -f "$file" ]]; then
+                state=$(pacing_rx_read "$iface") || { rc=1; continue; }
+                if [[ $(jq -r .boot <<< "$state") != "$boot" ]]; then
+                    rm -- "$file" || { rc=1; continue; }
+                fi
+            fi
+            if pacing_apply_duplex "$iface" "$rate"; then
+                echo "已恢复 $iface 双向限速。"
+            else rc=1; fi
+        elif pacing_prepare_and_apply "$iface" "$rate"; then
             echo "已在 $iface 恢复每流上限: $(pacing_human_rate "$rate")"
         else
             rc=1
         fi
-    done < <(jq -r '.[] | [.iface, (.rate|tostring)] | @tsv' <<< "$items")
+    done < <(jq -r '.[] | [.iface, (.rate|tostring), (.ingress // false | tostring)] | @tsv' <<< "$items")
     return $rc
 }
 
@@ -12453,21 +12684,28 @@ pacing_disable_states() {
 pacing_enable_all() {
     pacing_input_rate || return 1
     if [[ "$PACING_INPUT_RATE" == 0 ]]; then pacing_disable_all; return $?; fi
-    echo "对所选网卡的出站 FQ 流设置每流上限（含 TCP/UDP，不是整卡总带宽，不管入站）。"
+    echo "对所选网卡设置双向每流上限：出站 FQ，入站专用 IFB + FQ（含 TCP/UDP）。"
+    echo "已有其他 ingress/clsact 时会停止；超过速率的流量会排队。"
     echo "不改 BBR / TCP 缓冲区。零 handle 的根 FQ 或 mq 叶子会自动迁移（可能短暂丢包）。"
     echo "与菜单 36 的 CAKE 互斥；成功后会安装开机恢复。普通文件运行会安装当前这份；在线 curl 会再下载一份 GitHub main。"
     pacing_warn_qdisc_conflict
     pacing_pick_iface || return 1
-    pacing_locked pacing_apply_persistent "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"
+    pacing_locked pacing_apply_persistent "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE" both
 }
 
 pacing_apply_persistent() {
+    local direction="${3:-egress}"
+    [[ "$direction" == both || "$direction" == egress ]] || return 1
     [[ ! -f "$PACING_POLICY_FILE" ]] || pacing_read_policy >/dev/null || {
         pacing_error "开机恢复策略损坏，未修改当前队列。"; return 1;
     }
     pacing_install_running_script "$PACING_INSTALLED_SCRIPT" || return 1
-    pacing_prepare_and_apply "$1" "$2" || return 1
-    pacing_enable_autostart "$1" "$2" || {
+    if [[ "$direction" == both ]]; then
+        pacing_apply_duplex "$1" "$2" || return 1
+    else
+        pacing_prepare_and_apply "$1" "$2" || return 1
+    fi
+    pacing_enable_autostart "$1" "$2" "$direction" || {
         pacing_error "当前限速已生效，但开机自动恢复设置失败，请重试设置。"; return 1;
     }
 }
@@ -12482,6 +12720,7 @@ pacing_disable_iface() {
     fi
     state=$(pacing_read_state "$file") || return 1
     [[ $(jq -r .iface <<< "$state") == "$iface" ]] || return 1
+    pacing_rx_disable "$iface" || return 1
     if [[ -f "$PACING_POLICY_FILE" ]]; then
         policy=$(pacing_read_policy) || return 1
         items=$(pacing_policy_items "$policy") || return 1
@@ -12502,7 +12741,7 @@ pacing_modify_rate() {
     if [[ "$PACING_INPUT_RATE" == 0 ]]; then
         pacing_locked pacing_disable_iface "$PACING_INPUT_IFACE"
     else
-        pacing_locked pacing_apply_persistent "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"
+        pacing_locked pacing_apply_persistent "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE" both
     fi
 }
 
@@ -12511,8 +12750,15 @@ pacing_disable_all() {
 }
 
 pacing_disable_all_locked() {
+    local file iface rc=0
     pacing_disable_autostart || { pacing_error "无法关闭开机恢复，未修改当前限速。"; return 1; }
-    pacing_disable_states
+    for file in "$PACING_STATE_DIR"/ingress/*.json; do
+        [[ -f "$file" ]] || continue
+        iface=${file##*/}; iface=${iface%.json}
+        pacing_rx_disable "$iface" || rc=1
+    done
+    pacing_disable_states || rc=1
+    return "$rc"
 }
 
 pacing_status_one() {
@@ -12531,20 +12777,33 @@ pacing_status_one() {
 }
 
 pacing_status_summary() {
-    local policy items file
+    local policy items file iface rate ingress state
     if policy=$(pacing_read_policy) && items=$(pacing_policy_items "$policy"); then
         echo "开机自动恢复: 已启用"
-        while IFS=$'\t' read -r iface rate; do
+        while IFS=$'\t' read -r iface rate ingress; do
             [[ -n "$iface" ]] || continue
-            echo "  - $iface / $(pacing_human_rate "$rate")"
-        done < <(jq -r '.[] | [.iface, (.rate|tostring)] | @tsv' <<< "$items")
+            if [[ "$ingress" == true ]]; then
+                echo "  - $iface / 双向各 $(pacing_human_rate "$rate")"
+            else
+                echo "  - $iface / 旧版仅出站 $(pacing_human_rate "$rate")；用 [2] 升级双向"
+            fi
+        done < <(jq -r '.[] | [.iface, (.rate|tostring), (.ingress // false | tostring)] | @tsv' <<< "$items")
     elif [[ -f "$PACING_POLICY_FILE" ]]; then
         echo "开机自动恢复: 策略损坏，请先关闭限速后重新设置。"
     else
         echo "开机自动恢复: 未启用。"
     fi
     echo "系统会在开机网络就绪后重试恢复；网卡被运行时重建时仍需重新设置。"
-    echo "本功能限的是出站每流（含 UDP），不是整卡，也不改 TCP 参数。"
+    echo "新设置为双向每流（含 UDP）；旧单向设置需重新设置才升级。"
+    for file in "$PACING_STATE_DIR"/ingress/*.json; do
+        [[ -f "$file" ]] || continue
+        iface=${file##*/}; iface=${iface%.json}
+        if state=$(pacing_rx_read "$iface") && pacing_rx_verify "$state"; then
+            echo "入站实际: $iface / $(pacing_human_rate "$(jq -r .rate <<< "$state")") / $(jq -r .phase <<< "$state")"
+        else
+            echo "入站: $iface 未能验证或操作未完成，请用 [3] 检查，[4] 关闭。"
+        fi
+    done
     if [[ -f "$PACING_CONFIG_FILE" ]]; then
         pacing_status_one "$PACING_CONFIG_FILE"
     fi
@@ -12567,6 +12826,7 @@ pacing_view_realtime() {
     for path in /sys/class/net/*; do
         iface=${path##*/}; [[ "$iface" == lo ]] && continue
         tc -s -d qdisc show dev "$iface"
+        tc -s -d filter show dev "$iface" ingress
     done
     echo "TCP 信息（send/pacing_rate 是内核估计，不是实际吞吐测速）："
     ss -tinm | head -n 100
@@ -12684,7 +12944,7 @@ manage_tcp_pacing_limit() {
     pacing_dependencies || { break_end; return 1; }
     while true; do
         clear
-        echo "FQ 每流限速管理（出站每流，含 TCP/UDP；不是整卡，不管入站）"
+        echo "FQ 双向每流限速管理（入站/出站各限速，含 TCP/UDP）"
         echo "与菜单 36 CAKE 互斥。纯数字按 MiB/s（20 = 20M）。"
         pacing_status_summary
         echo "1. 选择网卡并限速（零 handle FQ / mq 会自动迁移）"
