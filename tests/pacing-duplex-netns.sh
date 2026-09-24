@@ -151,6 +151,18 @@ pacing_rx_verify "$(pacing_rx_read srv)"
 pacing_restore_boot # idempotent in the same boot
 measure restored-download 192.0.2.1 11500000 22500000 -R
 
+# A second managed interface must have its own IFB; disabling it leaves srv.
+ip link add srv2 type dummy
+ip link set srv2 up
+tc qdisc replace dev srv2 root handle 1: fq
+pacing_apply_persistent srv2 1048576 both
+second_ifb=$(jq -r .ifb <<< "$(pacing_rx_read srv2)")
+[[ "$second_ifb" != "$ifb" ]]
+pacing_disable_iface srv2
+! ip link show dev "$second_ifb" >/dev/null 2>&1
+pacing_rx_verify "$(pacing_rx_read srv)"
+jq -e '.items|length == 1 and .[0].iface == "srv" and .[0].ingress == true' "$PACING_POLICY_FILE" >/dev/null
+
 pacing_disable_all_locked
 assert_clean_rx
 [[ ! -e "$PACING_POLICY_FILE" && ! -e "$PACING_CONFIG_FILE" ]]

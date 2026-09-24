@@ -12160,8 +12160,9 @@ pacing_rx_identity() {
         pacing_error "$iface 已重建或记录跨启动，未操作入站队列。"; return 1;
     }
     link=$(ip -j -d link show dev "$ifb") || return 1
-    jq -e --argjson state "$state" 'length == 1 and
+    jq -e --argjson state "$state" --arg require_up "${2:-false}" 'length == 1 and
       .[0].linkinfo.info_kind == "ifb" and
+      ($require_up != "true" or (.[0].flags | index("UP")) != null) and
       (.[0].ifalias == $state.owner or
         ($state.phase == "pending" and $state.ifb_index != null and (.[0].ifalias // "") == "")) and
       ($state.ifb_index == null or .[0].ifindex == $state.ifb_index)' <<< "$link" >/dev/null || {
@@ -12183,7 +12184,7 @@ pacing_rx_filters_match() {
 
 pacing_rx_verify() {
     local state="$1" iface ifb qdiscs filters root
-    pacing_rx_identity "$state" || return 1
+    pacing_rx_identity "$state" true || return 1
     iface=$(jq -r .iface <<< "$state"); ifb=$(jq -r .ifb <<< "$state")
     qdiscs=$(tc -j qdisc show dev "$iface") || return 1
     jq -e '[.[]|select(.kind == "ingress" or .kind == "clsact")] |
@@ -12261,6 +12262,10 @@ pacing_rx_disable() {
             }
             tc filter del dev "$iface" ingress protocol all pref 49139 handle 1 matchall || return 1
         fi
+        filters=$(tc -j filter show dev "$iface" ingress) || return 1
+        jq -e 'length == 0' <<< "$filters" >/dev/null || {
+            pacing_error "清理期间出现其他入站过滤器，保留队列及 IFB。"; return 1;
+        }
         tc qdisc del dev "$iface" ingress || return 1
     fi
     if jq -e --arg ifb "$ifb" 'any(.[]; .ifname == $ifb)' <<< "$links" >/dev/null; then
