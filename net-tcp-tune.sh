@@ -12204,7 +12204,10 @@ pacing_kernel_tool() {
     for path in /usr/sbin /sbin; do
         if [[ -x "$path/$tool" ]]; then "$path/$tool" "$@"; return $?; fi
     done
-    pacing_error "未找到 $tool；请安装 kmod，并以 root（sudo -i）运行。"
+    case "$tool" in
+        modprobe|modinfo) pacing_error "未找到 $tool；请安装 kmod，并以 root（sudo -i）运行。" ;;
+        *) pacing_error "未找到管理工具 $tool，停止操作。" ;;
+    esac
     return 127
 }
 
@@ -12219,7 +12222,7 @@ pacing_ifb_config() {
     fi
 }
 
-pacing_ifb_candidates() {
+pacing_ifb_kernel_versions() {
     local config kernel current
     current=$(uname -r)
     for config in /boot/config-*; do
@@ -12231,8 +12234,136 @@ pacing_ifb_candidates() {
         if grep -qx 'CONFIG_IFB=m' "$config"; then
             pacing_kernel_tool modinfo -k "$kernel" ifb >/dev/null 2>&1 || continue
         fi
-        echo "已安装的 IFB 候选内核: $kernel（尚未验证 GRUB、启动及网络）"
+        printf '%s\n' "$kernel"
     done
+}
+
+pacing_ifb_candidates() {
+    local kernel
+    while IFS= read -r kernel; do
+        echo "已安装的 IFB 候选内核: $kernel（尚未验证 GRUB、启动及网络）"
+    done < <(pacing_ifb_kernel_versions)
+}
+
+# Deliberately limited to the standard Debian/Ubuntu generated GRUB ID layout.
+# Never source/eval grub.cfg or guess a menu index (recovery entries differ).
+pacing_grub_entry() {
+    local kernel="$1" file="${2:-/boot/grub/grub.cfg}"
+    [[ "$kernel" =~ ^[a-zA-Z0-9_.+-]+$ && -r "$file" ]] || return 1
+    awk -F "'" -v kernel="$kernel" '
+      /^[[:space:]]*submenu / {
+        parent=$4
+        if (parent !~ /^gnulinux-advanced-[a-zA-Z0-9-]+$/) parent=""
+      }
+      /^}/ { parent="" }
+      /^[[:space:]]*menuentry / {
+        prefix="gnulinux-" kernel "-advanced-"
+        if (index($4, prefix) != 1) next
+        suffix=substr($4, length(prefix)+1)
+        if (suffix !~ /^[a-zA-Z0-9-]+$/) next
+        if (parent != "gnulinux-advanced-" suffix) next
+        entry=parent ">" $4; count++
+      }
+      END { if (count == 1) print entry; else exit 1 }
+    ' "$file"
+}
+
+pacing_kernel_can_prompt() { [[ $EUID -eq 0 && -t 0 && -t 1 ]]; }
+pacing_grub_env() { pacing_kernel_tool grub-editenv /boot/grub/grubenv "$@"; }
+
+pacing_grub_preflight() {
+    local source fs types env
+    [[ -f /boot/grub/grub.cfg && -f /boot/grub/grubenv && ! -L /boot/grub/grubenv ]] || {
+        pacing_error "未找到标准 GRUB 配置/环境块，请人工切换内核。"; return 1;
+    }
+    grep -Eq '^[[:space:]]*set default="\$\{next_entry\}"[[:space:]]*$' /boot/grub/grub.cfg &&
+    grep -Eq '^[[:space:]]*save_env next_entry[[:space:]]*$' /boot/grub/grub.cfg || {
+        pacing_error "GRUB 配置未确认支持一次性启动，请人工核对。"; return 1;
+    }
+    pacing_kernel_tool grub-script-check /boot/grub/grub.cfg || return 1
+    source=$(findmnt -n -o SOURCE -T /boot/grub/grubenv) || return 1
+    fs=$(findmnt -n -o FSTYPE -T /boot/grub/grubenv) || return 1
+    [[ "$source" == /dev/* && "$fs" =~ ^ext[234]$ ]] || {
+        pacing_error "仅自动处理普通磁盘上的 ext2/3/4 GRUB 环境块；其他布局请人工核对。"; return 1;
+    }
+    types=$(lsblk -snro TYPE "$source") || return 1
+    [[ -n "$types" ]] && ! grep -qvE '^(disk|part)$' <<< "$types" || {
+        pacing_error "检测到 LVM/RAID/加密或未知磁盘布局，不自动安排试启动。"; return 1;
+    }
+    env=$(pacing_grub_env list) || return 1
+    if grep -qE '^next_entry=.+' <<< "$env"; then
+        pacing_error "已有下次启动安排，未覆盖；请先人工确认："
+        printf '%s\n' "$env"
+        return 1
+    fi
+}
+
+pacing_kernel_stage_once() {
+    local kernel="$1" entry="$2" actual backup env
+    # Recheck at the mutation boundary, after the user has selected/confirmed.
+    pacing_grub_preflight || return 1
+    pacing_ifb_kernel_versions | grep -Fxq -- "$kernel" || return 1
+    actual=$(pacing_grub_entry "$kernel") || return 1
+    [[ "$actual" == "$entry" ]] || return 1
+    backup=$(mktemp /boot/grub/grubenv.pacing-backup.XXXXXX) || return 1
+    cp -p -- /boot/grub/grubenv "$backup" || return 1
+    echo "GRUB 环境块备份: $backup"
+    if pacing_kernel_tool grub-reboot --boot-directory=/boot "$entry"; then
+        env=$(pacing_grub_env list) || {
+            pacing_error "无法读回启动安排，不会重启；请人工检查 GRUB 环境块。"; return 1;
+        }
+        if grep -Fxq -- "next_entry=$entry" <<< "$env"; then return 0; fi
+    fi
+    pacing_error "一次性启动设置或校验失败，不会重启。"
+    # Only clear the entry we just requested; never restore over unrelated edits.
+    if env=$(pacing_grub_env list) && grep -Fxq -- "next_entry=$entry" <<< "$env"; then
+        pacing_grub_env unset next_entry || pacing_error "无法撤销启动安排，请人工核对。"
+    fi
+    return 1
+}
+
+pacing_kernel_wizard() {
+    local kernel entry choice answer i
+    local -a kernels=() entries=()
+    pacing_kernel_can_prompt || return 1
+    pacing_grub_preflight || return 1
+    while IFS= read -r kernel; do
+        entry=$(pacing_grub_entry "$kernel") || continue
+        kernels+=("$kernel"); entries+=("$entry")
+    done < <(pacing_ifb_kernel_versions | sort -Vr)
+    ((${#kernels[@]})) || {
+        pacing_error "没有同时具备 IFB、启动文件和可识别 GRUB 菜单项的已安装内核。"; return 1;
+    }
+    echo "可选择以下 IFB 内核进行下一次试启动（不保证启动/网络正常）："
+    for i in "${!kernels[@]}"; do printf '  %d. %s\n' "$((i + 1))" "${kernels[i]}"; done
+    echo "  0. 取消，保持现状"
+    read -r -p "选择内核编号 [默认取消]: " choice || return 1
+    [[ "$choice" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+    ((10#$choice <= ${#kernels[@]})) || return 1
+    i=$((10#$choice - 1)); kernel=${kernels[i]}; entry=${entries[i]}
+    echo "仅安排下一次启动 $kernel；不删除旧内核，不更改永久默认内核。"
+    echo "重启会中断 SSH 和业务；启动失败不会自动重启救援。请确保云平台控制台/救援入口可用。"
+    read -r -p "确认已有救援入口，并同意设置这次试启动？[y/N]: " answer || return 1
+    [[ "$answer" == y || "$answer" == Y ]] || return 1
+    pacing_kernel_stage_once "$kernel" "$entry" || return 1
+    echo "已校验下次启动安排。本次输入的限速尚未生效，原限速策略未更改。"
+    echo "重启后请进入 39 → 2（首次设置用 1）重新设置；测试成功后再确认永久默认内核。"
+    echo "取消试启动可执行：grub-editenv /boot/grub/grubenv unset next_entry"
+    read -r -p "是否立即重启？将断开 SSH 并中断业务 [y/N]: " answer || return 0
+    if [[ "$answer" == y || "$answer" == Y ]]; then
+        pacing_kernel_tool reboot || { pacing_error "重启命令失败；下次启动安排仍保留。"; return 1; }
+    else
+        echo "未重启；下次自行重启时会使用所选内核。"
+    fi
+}
+
+pacing_apply_interactive() {
+    if ! pacing_ifb_ready; then
+        pacing_kernel_wizard
+        # Never report the requested rate as applied just because boot was set.
+        return 1
+    fi
+    pacing_apply_persistent "$1" "$2" both
 }
 
 pacing_ifb_ready() {
@@ -12251,7 +12382,7 @@ pacing_ifb_ready() {
         pacing_error "当前内核 $kernel 的 IFB 模块加载失败；请核对匹配的模块包、权限及内核限制。"
     fi
     pacing_ifb_candidates
-    echo "未修改出站队列；不会自动安装/切换内核、修改 GRUB 或重启。"
+    echo "未修改出站队列；不会无人确认就切换内核或重启。交互设置可继续选择已安装的 IFB 内核。"
     echo "更换内核需先确认云平台救援入口，再验证一次性启动。"
     return 1
 }
@@ -12954,7 +13085,7 @@ pacing_enable_all() {
     echo "与菜单 36 的 CAKE 互斥；成功后会安装开机恢复。普通文件运行会安装当前这份；在线 curl 会再下载一份 GitHub main。"
     pacing_warn_qdisc_conflict
     pacing_pick_iface || return 1
-    pacing_locked pacing_apply_persistent "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE" both
+    pacing_locked pacing_apply_interactive "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"
 }
 
 pacing_apply_persistent() {
@@ -13005,7 +13136,7 @@ pacing_modify_rate() {
     if [[ "$PACING_INPUT_RATE" == 0 ]]; then
         pacing_locked pacing_disable_iface "$PACING_INPUT_IFACE"
     else
-        pacing_locked pacing_apply_persistent "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE" both
+        pacing_locked pacing_apply_interactive "$PACING_INPUT_IFACE" "$PACING_INPUT_RATE"
     fi
 }
 
