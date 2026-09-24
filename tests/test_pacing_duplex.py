@@ -31,6 +31,67 @@ class DuplexTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertFalse(self.events.exists())
 
+    def test_ifb_loaded_or_builtin_needs_no_modprobe(self):
+        for setup in (
+            'pacing_ifb_loaded() { return 0; }',
+            'pacing_ifb_loaded() { return 1; }; pacing_ifb_config() { echo CONFIG_IFB=y; }',
+        ):
+            self.ok('pacing_ifb_ready', setup + '\npacing_kernel_tool() { return 99; }')
+
+    def test_ifb_module_is_loaded_with_no_default_devices(self):
+        setup = '''
+pacing_ifb_loaded() { return 1; }
+pacing_ifb_config() { echo CONFIG_IFB=m; }
+pacing_kernel_tool() { [[ "$*" == 'modprobe ifb numifbs=0' ]]; }
+'''
+        self.ok('pacing_ifb_ready', setup)
+        # Missing config is not proof that IFB is unsupported; try loading it.
+        self.ok('pacing_ifb_ready', setup + '\npacing_ifb_config() { return 1; }')
+
+    def test_unsupported_ifb_stops_before_egress_migration(self):
+        for config in ('# CONFIG_IFB is not set', 'CONFIG_IFB=m'):
+            setup = '''
+pacing_rx_preflight() { return 0; }
+pacing_ifb_loaded() { return 1; }
+pacing_ifb_candidates() { echo 'candidate kernel'; }
+pacing_kernel_tool() { return 1; }
+pacing_ensure_addressable() { echo migration >> "$EVENTS"; }
+'''+ "\npacing_ifb_config() { echo '" + config + "'; }"
+            result = self.run_shell('pacing_apply_duplex eth0 1048576', setup)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('candidate kernel', result.stdout)
+            self.assertFalse(self.events.exists())
+            self.assertFalse((self.base / 'states').exists())
+
+    def test_empty_failed_creation_can_retry_without_removing_network(self):
+        path = self.ingress_journal('boot-1')
+        state = json.loads(path.read_text())
+        state['ifb_index'] = None
+        path.write_text(json.dumps(state))
+        setup = '''
+ip() { echo '[]'; }
+tc() {
+    [[ "$1" == -j ]] || return 99
+    echo '[{"kind":"fq","root":true}]'
+}
+'''
+        self.ok('pacing_rx_forget_empty_pending eth0', setup)
+        self.assertFalse(path.exists())
+
+    def test_pending_with_existing_device_or_ingress_is_preserved(self):
+        for links, qdiscs in (
+            ('[{"ifname":"ntifb2"}]', '[]'),
+            ('[]', '[{"kind":"ingress"}]'),
+            ('[]', '[{"kind":"clsact"}]'),
+        ):
+            path = self.ingress_journal('boot-1')
+            state = json.loads(path.read_text())
+            state['ifb_index'] = None
+            path.write_text(json.dumps(state))
+            setup = f"ip() {{ echo '{links}'; }}\ntc() {{ echo '{qdiscs}'; }}"
+            self.assertNotEqual(self.run_shell('pacing_rx_forget_empty_pending eth0', setup).returncode, 0)
+            self.assertTrue(path.exists())
+
     def test_forget_validates_ingress_before_removing_egress(self):
         self.ok('pacing_apply_rate eth0 1048576')
         state = json.loads(self.config.read_text())

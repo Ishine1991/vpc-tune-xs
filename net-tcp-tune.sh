@@ -12197,9 +12197,86 @@ pacing_rx_verify() {
       .options.maxrate == $rate and .options.orphan_mask == 4294967295' <<< "$root" >/dev/null
 }
 
+pacing_kernel_tool() {
+    local tool="$1" path
+    shift
+    if command -v "$tool" >/dev/null 2>&1; then "$tool" "$@"; return $?; fi
+    for path in /usr/sbin /sbin; do
+        if [[ -x "$path/$tool" ]]; then "$path/$tool" "$@"; return $?; fi
+    done
+    pacing_error "未找到 $tool；请安装 kmod，并以 root（sudo -i）运行。"
+    return 127
+}
+
+pacing_ifb_loaded() { [[ -d /sys/module/ifb ]]; }
+
+pacing_ifb_config() {
+    local kernel="$1"
+    if [[ -r "/boot/config-$kernel" ]]; then
+        grep -E '^(CONFIG_IFB=|# CONFIG_IFB is not set)' "/boot/config-$kernel"
+    elif [[ "$kernel" == "$(uname -r)" && -r /proc/config.gz ]]; then
+        zcat /proc/config.gz | grep -E '^(CONFIG_IFB=|# CONFIG_IFB is not set)'
+    fi
+}
+
+pacing_ifb_candidates() {
+    local config kernel current
+    current=$(uname -r)
+    for config in /boot/config-*; do
+        [[ -f "$config" ]] || continue
+        kernel=${config#/boot/config-}
+        [[ "$kernel" != "$current" && -f "/boot/vmlinuz-$kernel" &&
+           -f "/boot/initrd.img-$kernel" ]] || continue
+        grep -qxE 'CONFIG_IFB=[my]' "$config" || continue
+        if grep -qx 'CONFIG_IFB=m' "$config"; then
+            pacing_kernel_tool modinfo -k "$kernel" ifb >/dev/null 2>&1 || continue
+        fi
+        echo "已安装的 IFB 候选内核: $kernel（尚未验证 GRUB、启动及网络）"
+    done
+}
+
+pacing_ifb_ready() {
+    local kernel config
+    pacing_ifb_loaded && return 0
+    kernel=$(uname -r) || return 1
+    config=$(pacing_ifb_config "$kernel") || config=""
+    if [[ "$config" == 'CONFIG_IFB=y' ]]; then return 0; fi
+    if [[ "$config" == '# CONFIG_IFB is not set' ]]; then
+        pacing_error "当前内核 $kernel 未编译 IFB（CONFIG_IFB 未启用），无法设置入站限速。"
+    else
+        echo "正在加载 IFB 模块（不创建默认 IFB 网卡）..."
+        if pacing_kernel_tool modprobe ifb numifbs=0; then
+            return 0
+        fi
+        pacing_error "当前内核 $kernel 的 IFB 模块加载失败；请核对匹配的模块包、权限及内核限制。"
+    fi
+    pacing_ifb_candidates
+    echo "未修改出站队列；不会自动安装/切换内核、修改 GRUB 或重启。"
+    echo "更换内核需先确认云平台救援入口，再验证一次性启动。"
+    return 1
+}
+
+# Recover only an empty creation attempt, never delete a device or qdisc here.
+pacing_rx_forget_empty_pending() {
+    local iface="$1" state links qdiscs
+    state=$(pacing_rx_read "$iface") || return 1
+    jq -e '.phase == "pending" and .ingress_owned == false and .ifb_index == null' <<< "$state" >/dev/null || return 1
+    [[ $(jq -r .boot <<< "$state") == "$(pacing_boot_id)" &&
+       $(jq -r .ifindex <<< "$state") == "$(pacing_ifindex "$iface")" ]] || return 1
+    links=$(ip -j link show) || return 1
+    jq -e --arg ifb "$(jq -r .ifb <<< "$state")" 'type == "array" and all(.[]; .ifname != $ifb)' <<< "$links" >/dev/null || return 1
+    qdiscs=$(tc -j qdisc show dev "$iface") || return 1
+    jq -e 'type == "array" and all(.[]; .kind != "ingress" and .kind != "clsact")' <<< "$qdiscs" >/dev/null || return 1
+    rm -- "$(pacing_rx_file "$iface")" || return 1
+    echo "已清理 $iface 未创建任何入站资源的失败记录，可以重试。"
+}
+
 pacing_rx_preflight() {
     local iface="$1" state qdiscs index links
     [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ && "$iface" != lo ]] || return 1
+    if [[ -e "$(pacing_rx_file "$iface")" ]]; then
+        pacing_rx_forget_empty_pending "$iface" || true
+    fi
     if [[ -e "$(pacing_rx_file "$iface")" ]]; then
         state=$(pacing_rx_read "$iface") || { pacing_error "入站记录损坏，未修改网络。"; return 1; }
         [[ $(jq -r .phase <<< "$state") == active ]] && pacing_rx_verify "$state" || {
@@ -12284,6 +12361,7 @@ pacing_rx_apply() {
     local iface="$1" rate="$2" file state old="" index boot ifb owner link pending
     pacing_valid_rate "$rate" && ((rate > 0 && rate < 4294967295)) || return 1
     pacing_rx_preflight "$iface" || return 1
+    pacing_ifb_ready || return 1
     file=$(pacing_rx_file "$iface")
     if [[ -f "$file" ]]; then
         old=$(pacing_rx_read "$iface") || return 1
@@ -12314,7 +12392,9 @@ pacing_rx_apply() {
     pacing_write_file "$file" 600 "$state" || return 1
     if ! ip link add name "$ifb" type ifb; then
         pacing_error "无法创建 IFB；请检查内核 ifb 支持。出站上限尚未修改。"
-        # No deletion on add failure: a concurrent creator could own the name.
+        # Discard the journal only if no device/qdisc exists. Never delete a
+        # concurrent creator's device after an add failure.
+        pacing_rx_forget_empty_pending "$iface" || true
         return 1
     fi
     link=$(ip -j -d link show dev "$ifb") || return 1
@@ -12352,6 +12432,8 @@ pacing_rx_apply() {
 pacing_apply_duplex() {
     local iface="$1" rate="$2" old_rx=""
     pacing_rx_preflight "$iface" || return 1
+    # Check module support BEFORE potentially disruptive mq/FQ migration.
+    pacing_ifb_ready || return 1
     # Migration checks must run before installing ingress on the same device.
     pacing_ensure_addressable "$iface" || return 1
     if [[ -f "$(pacing_rx_file "$iface")" ]]; then old_rx=$(pacing_rx_read "$iface") || return 1; fi

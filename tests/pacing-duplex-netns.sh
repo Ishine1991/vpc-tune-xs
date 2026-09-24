@@ -67,6 +67,17 @@ if pacing_apply_duplex srv 1048576; then exit 1; fi
 ip -j -d link show dev "$ifb" | jq -e '.[0].linkinfo.info_kind == "dummy"' >/dev/null
 ip link del dev "$ifb"
 
+# IFB creation may still fail despite module support (e.g. container policy).
+# A failed attempt with no resources must not leave a journal blocking retries.
+ip() {
+    if [[ "$1 $2 $3 $4" == "link add name $ifb" ]]; then return 1; fi
+    command ip "$@"
+}
+if pacing_apply_duplex srv 1048576; then exit 1; fi
+unset -f ip
+assert_clean_rx
+[[ $(pacing_layout_rate "$(pacing_read_layout srv)") == 4294967295 ]]
+
 # A full disk after successful ingress creation must not strand our resources.
 # Fail all ownership-journal writes, not just a one-shot write failure.
 eval "$(declare -f pacing_write_file | sed '1s/pacing_write_file/pacing_test_write_file/')"
