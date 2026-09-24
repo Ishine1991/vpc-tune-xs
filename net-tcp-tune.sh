@@ -12227,7 +12227,12 @@ pacing_rx_disable() {
     local iface="$1" file state ifb qdiscs filters root links
     file=$(pacing_rx_file "$iface")
     [[ -e "$file" ]] || return 0
-    state=$(pacing_rx_read "$iface") || { pacing_error "入站恢复记录损坏: $file"; return 1; }
+    # Only the creating call may supply its known-successful in-memory state
+    # when persisting that state failed. Later invocations use the disk journal.
+    state="${2:-}"
+    if [[ -z "$state" ]]; then
+        state=$(pacing_rx_read "$iface") || { pacing_error "入站恢复记录损坏: $file"; return 1; }
+    fi
     if [[ $(jq -r .boot <<< "$state") != "$(pacing_boot_id)" ]]; then
         rm -- "$file" || return 1
         return 0
@@ -12250,7 +12255,7 @@ pacing_rx_disable() {
     qdiscs=$(tc -j qdisc show dev "$iface") || return 1
     if jq -e 'any(.[]; .kind == "ingress" or .kind == "clsact")' <<< "$qdiscs" >/dev/null; then
         [[ $(jq -r .ingress_owned <<< "$state") == true ]] || {
-            pacing_error "入站队列归属尚未确认，保留记录。"; return 1;
+            pacing_error "入站队列归属尚未确认（可能在创建后被强制中断），保留队列及记录；请人工核对，不能安全自动删除。"; return 1;
         }
         jq -e '[.[]|select(.kind == "ingress" or .kind == "clsact")] |
           length == 1 and .[0].kind == "ingress" and .[0].handle == "ffff:"' <<< "$qdiscs" >/dev/null || return 1
@@ -12328,7 +12333,11 @@ pacing_rx_apply() {
         return 1
     fi
     state=$(jq -c '.ingress_owned=true' <<< "$state") || return 1
-    pacing_write_file "$file" 600 "$state" || return 1
+    if ! pacing_write_file "$file" 600 "$state"; then
+        pacing_error "保存入站队列归属失败，正在撤销刚创建的队列。"
+        pacing_rx_disable "$iface" "$state" || pacing_error "撤销未完成，保留恢复记录，请人工核对入站队列。"
+        return 1
+    fi
     if tc filter add dev "$iface" ingress protocol all pref 49139 handle 1 \
          matchall skip_hw action mirred egress redirect dev "$ifb" &&
        pacing_rx_verify "$state" &&
@@ -13085,7 +13094,8 @@ pacing_legacy_cleanup() {
 }
 
 pacing_forget_stale() {
-    local state boot file found=0
+    local state boot file
+    local -a stale_files=()
     boot=$(pacing_boot_id) && [[ -n "$boot" ]] || {
         pacing_error "无法读取当前启动标识，保留恢复记录。"; return 1;
     }
@@ -13094,8 +13104,7 @@ pacing_forget_stale() {
         [[ "$boot" != "$(jq -r .boot <<< "$state")" ]] || {
             pacing_error "同一次启动的记录请使用 [4] 恢复，不能直接删除。"; return 1;
         }
-        rm -- "$PACING_CONFIG_FILE" || return 1
-        found=1
+        stale_files+=("$PACING_CONFIG_FILE")
     fi
     if [[ -d "$PACING_STATE_DIR" ]]; then
         for file in "$PACING_STATE_DIR"/*.json; do
@@ -13104,11 +13113,22 @@ pacing_forget_stale() {
             [[ "$boot" != "$(jq -r .boot <<< "$state")" ]] || {
                 pacing_error "同一次启动的记录请使用 [4] 恢复，不能直接删除。"; return 1;
             }
-            rm -- "$file" || return 1
-            found=1
+            stale_files+=("$file")
         done
     fi
-    (( found )) || return 1
+    for file in "$PACING_STATE_DIR"/ingress/*.json; do
+        [[ -f "$file" ]] || continue
+        state=$(pacing_rx_read "$(basename -- "$file" .json)") || {
+            pacing_error "入站恢复记录损坏，未删除任何记录。"; return 1;
+        }
+        [[ "$boot" != "$(jq -r .boot <<< "$state")" ]] || {
+            pacing_error "同一次启动的入站记录请使用 [4] 恢复，不能直接删除。"; return 1;
+        }
+        stale_files+=("$file")
+    done
+    # Validate every journal before deleting any, including ingress-only failures.
+    ((${#stale_files[@]})) || return 1
+    for file in "${stale_files[@]}"; do rm -- "$file" || return 1; done
     echo "已删除上次启动的记录，未修改当前网络。"
 }
 

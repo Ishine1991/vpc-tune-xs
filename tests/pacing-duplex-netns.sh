@@ -67,6 +67,23 @@ if pacing_apply_duplex srv 1048576; then exit 1; fi
 ip -j -d link show dev "$ifb" | jq -e '.[0].linkinfo.info_kind == "dummy"' >/dev/null
 ip link del dev "$ifb"
 
+# A full disk after successful ingress creation must not strand our resources.
+# Fail all ownership-journal writes, not just a one-shot write failure.
+eval "$(declare -f pacing_write_file | sed '1s/pacing_write_file/pacing_test_write_file/')"
+pacing_write_file() {
+    if [[ "$1" == "$(pacing_rx_file srv)" ]] &&
+       jq -e '.ingress_owned == true' <<< "$3" >/dev/null; then
+        return 1
+    fi
+    pacing_test_write_file "$@"
+}
+if pacing_apply_duplex srv 1048576; then exit 1; fi
+unset -f pacing_write_file
+eval "$(declare -f pacing_test_write_file | sed '1s/pacing_test_write_file/pacing_write_file/')"
+unset -f pacing_test_write_file
+assert_clean_rx
+[[ $(pacing_layout_rate "$(pacing_read_layout srv)") == 4294967295 ]]
+
 # Fail after ingress attachment but before redirect; remove only our resources.
 tc() {
     if [[ "$1 $2" == "filter add" ]]; then return 1; fi
