@@ -2,7 +2,13 @@
 
 ## 第 39 项限速（脚本 2.4）
 
-第 39 项管理**选定网卡的 FQ 出站每流上限**（TCP 和 UDP 都会被限制，入站不管，也不是整卡总带宽）。支持单根 FQ，也支持 `mq + FQ` 叶子。保留根 `mq`，对全部直属 FQ 发送叶子设置相同上限；任一叶子失败会尝试整体回滚。不切换 BBR，不改 TCP 缓冲区。AWS 等机器的 `mq + FQ_CoDel` 会先备份并转换为 `mq + FQ`；CAKE、HTB、根 FQ_CoDel 或混合叶子仍会拒绝覆盖。
+第 39 项管理**选定网卡的双向每流上限**，入站和出站分别使用输入的速率（包括 TCP、UDP）。出站使用原 FQ，入站通过专用 IFB + FQ 排队。支持单根 FQ 和 `mq + FQ`，保留根 `mq`；AWS 等机器的 `mq + FQ_CoDel` 会先备份并转换为 FQ。CAKE、HTB、根 FQ_CoDel 或混合叶子仍会拒绝覆盖，不切换 BBR 或修改 TCP 缓冲区。
+
+旧版本保存的策略仍按原来的单向方式恢复；更新脚本后进入 **39 → 2**，选择原网卡重新输入速率，即升级为双向。也可通过 **39 → 1** 重新选择网卡设置。输入 `20` 或 `20M` 表示入站、出站**各 20 MiB/s 每流**；多个流的总速度可以超过该值。
+
+入站需要内核支持 IFB、FQ、matchall 和 mirred。已有其他 ingress/clsact 时会停止，避免覆盖。关闭选项 4 会先断开本功能的入站重定向，再删除对应 IFB，恢复出站上限；发现规则被外部修改时会保留记录并提示核对。IFB 使用 `ntifb<接口索引>` 名称和专属标记。
+
+入站整形发生在数据到达服务器之后，不能阻止数据先占用运营商链路。限速会使超速流量排队或丢包，无法保证延迟完全不变。按 FQ 流划分也不等于按用户划分：多个复用在同一连接内的请求会共享上限，入站哈希也存在碰撞可能。
 
 **与菜单 36（CAKE）互斥**：36 会把 `default_qdisc` 改成 cake，重启后第 39 项无法恢复限速。
 
@@ -17,7 +23,7 @@ virtio 等网卡常见根 `mq handle 0:`、叶子 `parent :1/:2`。选项 **1 �
 - 已使用旧版的机器先执行 **39 → 5**。
 - 修改的是本地源码；在线 `curl` 安装仍取远端，需要先发布才会更新远端。
 
-隔离控制流测试：`python -m unittest discover -s tests -v`（需要 Bash 和 jq；Windows 可使用 Git Bash）。真实 Linux 队列测试：`sudo bash tests/pacing-netns.sh`，只在新网络命名空间的 dummy 接口上操作，不修改宿主机网卡。公网吞吐仍需在目标 VPS 上验证。
+隔离控制流测试：`python -m unittest discover -s tests -v`（需要 Bash 和 jq；Windows 可使用 Git Bash）。真实 Linux 队列测试：`sudo bash tests/pacing-netns.sh`。双向流量测试：`sudo bash tests/pacing-duplex-netns.sh`（另需 iperf3 和 Python 3），覆盖 IPv4/IPv6、TCP/UDP、多个流、修改失败回滚、开机恢复和关闭清理。这些测试在独立网络命名空间中创建测试接口；公网吞吐仍需在目标 VPS 上验证。
 
 # BBR v3 优化脚本 - Ultimate Edition v4.0.0
 
@@ -179,7 +185,7 @@ chmod +x net-tcp-tune.sh
 | **36** | NS论坛CAKE调优 | 与 **39 互斥**，会改 `default_qdisc=cake` |
 | **37** | 科技lion高性能模式 | 内核参数调优 |
 | **38** | AI代理工具箱 | Claude/WebUI/CRS/Fuclaude/Caddy |
-| **39** | FQ每流限速 | 出站每流（含 UDP），不是整卡；零 handle mq 自动迁移 |
+| **39** | FQ双向每流限速 | 入站 IFB + FQ、出站 FQ（含 UDP）；每方向每流各限速 |
 
 ---
 
@@ -222,7 +228,7 @@ chmod +x net-tcp-tune.sh
 
 若只要 20 KiB/s，输入 `20K` 并确认。`20M` 与纯数字 `20` 相同。这是字节/秒的 MiB，不是 20 Mbit/s。
 
-该功能限制出站每流（含 UDP），不是整卡总带宽，也不管入站。不要同时开菜单 36 的 CAKE。
+该功能对入站和出站分别设置每流上限（含 UDP）；不是整卡总带宽。旧单向配置需重新设置才升级双向。不要同时开菜单 36 的 CAKE。
 
 迁移失败时脚本会保留当前队列（不再 `tc qdisc del root`）。用选项 3 检查，必要时再选 1 或 7。
 关闭限速只清每流上限，不会把 mq handle 改回内核默认 `0:`。

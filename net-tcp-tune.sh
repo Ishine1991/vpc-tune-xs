@@ -12139,11 +12139,12 @@ pacing_migrate_zero_fq() {
 pacing_rx_file() { printf '%s/ingress/%s.json\n' "$PACING_STATE_DIR" "$1"; }
 
 pacing_rx_read() {
-    jq -ce 'select(.version == 1 and
+    jq -ce --arg iface "$1" 'select(.version == 1 and .iface == $iface and
       (.iface|test("^[a-zA-Z0-9_.:-]{1,15}$")) and
       (.ifindex|test("^[0-9]+$")) and (.ifb|test("^ntifb[0-9]+$")) and
       (.boot|type == "string" and length > 0) and
-      (.owner|type == "string" and startswith("net-tcp-tune:")) and
+      .ifb == ("ntifb" + .ifindex) and
+      .owner == ("net-tcp-tune:ingress:" + .iface + ":" + .ifindex + ":" + .boot) and
       (.ifb_index == null or (.ifb_index|type == "number" and . > 0)) and
       (.rate|type == "number" and . > 0 and . < 4294967295 and . == floor) and
       (.previous_rate == null or (.previous_rate|type == "number" and . > 0 and . < 4294967295 and . == floor)) and

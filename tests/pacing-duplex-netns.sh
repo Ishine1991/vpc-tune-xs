@@ -46,6 +46,11 @@ tc qdisc add dev srv root handle 1: fq limit 2345 flow_limit 67
 before_tcp=$(sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_congestion_control)
 ifb="ntifb$(pacing_ifindex srv)"
 assert_clean_rx() {
+    if [[ -e "$(pacing_rx_file srv)" ]]; then
+        cat "$(pacing_rx_file srv)"
+        ip -j -d link show dev "$ifb" || true
+        tc -j -d qdisc show dev srv
+    fi
     [[ ! -e "$(pacing_rx_file srv)" ]]
     ! ip link show dev "$ifb" >/dev/null 2>&1
     tc -j qdisc show dev srv | jq -e 'all(.[]; .kind != "ingress" and .kind != "clsact")' >/dev/null
